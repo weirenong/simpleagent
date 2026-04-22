@@ -1,0 +1,36 @@
+# === Models (CRITICAL) ===
+models/
+*.bin
+*.pt
+*.pth
+*.gguf
+*.safetensors
+
+# === Python ===
+pycache/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# === Virtual Environment ===
+.venv/
+venv/
+env/
+
+# === OS Files ===
+.DS_Store
+Thumbs.db
+
+# === Logs ===
+*.log
+
+# === IDE ===
+.idea/
+.vscode/
+
+# === Misc ===
+*.sqlite3
+*.db
