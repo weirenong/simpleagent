@@ -1,4 +1,4 @@
-# SimpleAgent — Low-Resource Local AI Agent
+# SimpleAgent — (Low-Resource AI Agent Framework)
 
 SimpleAgent is a lightweight local-first AI agent built around one core idea:
 
