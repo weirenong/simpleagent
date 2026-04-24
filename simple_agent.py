@@ -1212,7 +1212,19 @@ class SimpleAgentGUI:
         skill_ids = self._decide_skill_ids(prompt, memory_items)
 
         self.root.after(0, lambda: self._set_loading_base("Executing skills"))
-        skill_context = self._execute_skills(skill_ids, prompt)
+        raw_skill_context = self._execute_skills(skill_ids, prompt)
+
+        self.root.after(0, lambda: self._set_loading_base("Extracting relevant tool info"))
+        skill_context = self._refine_skill_context(
+            prompt=prompt,
+            raw_skill_context=raw_skill_context,
+            local_model_path=local_model_path,
+            env={
+                **os.environ.copy(),
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+            },
+        )
 
         self.root.after(0, lambda: self._set_loading_base("Building prompt"))
         prompt_parts: list[str] = []
@@ -1222,9 +1234,10 @@ class SimpleAgentGUI:
             prompt_parts.append(skill_context)
         if skill_context:
             prompt_parts.append(
-                "Use the skill results as grounding context. "
-                "Do not invent facts that are not present in the skill results. "
-                "If the skill results only provide source pages but not the exact requested answer, say that and point the user to the best source URLs."
+                "The tool information below has already been filtered for relevance to the user's original request. "
+                "Use it as supporting context to answer the user's actual question directly. "
+                "Do not merely summarise the tool information. "
+                "If the filtered tool information is incomplete, clearly say what is missing."
             )
         prompt_parts.append(f"Current user prompt:\n{prompt}")
         final_prompt = "\n\n".join(prompt_parts)
@@ -1242,6 +1255,57 @@ class SimpleAgentGUI:
             max_tokens=response_token_budget,
             env=env,
         )
+
+    def _refine_skill_context(
+        self,
+        prompt: str,
+        raw_skill_context: str,
+        local_model_path: Path,
+        env: dict[str, str],
+    ) -> str:
+        if not raw_skill_context.strip():
+            return ""
+
+        self.root.after(0, lambda: self._set_loading_base("Filtering tool results"))
+
+        refinement_prompt = (
+            "You are a retrieval filtering layer for a local AI agent.\n"
+            "Your job is NOT to answer the user yet.\n"
+            "Your job is to read raw tool results and extract only the information that helps answer the user's original request.\n\n"
+            "Rules:\n"
+            "1. Focus on the user's original intent.\n"
+            "2. Keep concrete facts, names, numbers, lists, dates, claims, and source URLs.\n"
+            "3. Remove irrelevant search-result descriptions, navigation text, boilerplate, repeated links, and generic summaries.\n"
+            "4. If the raw tool results do not contain the answer, say what is missing.\n"
+            "5. Do not invent information.\n"
+            "6. Return compact grounding notes only.\n\n"
+            f"Original user request:\n{prompt}\n\n"
+            f"Raw tool results:\n{raw_skill_context}\n\n"
+            "Filtered relevant tool information:"
+        )
+
+        try:
+            refined = self._generate_text_with_budget(
+                local_model_path=local_model_path,
+                prompt=refinement_prompt,
+                max_tokens=min(1024, self._clamp_response_tokens(self.selected_response_tokens)),
+                env=env,
+            )
+        except Exception as exc:
+            if self.debug:
+                print("\n===== TOOL RESULT REFINEMENT FAILED =====")
+                print(exc)
+                print("Falling back to raw skill context.")
+                print("===== TOOL RESULT REFINEMENT FAILED END =====\n")
+            return raw_skill_context
+
+        refined = refined.strip()
+        if self.debug:
+            print("\n===== REFINED TOOL CONTEXT START =====")
+            print(refined if refined else "<empty>")
+            print("===== REFINED TOOL CONTEXT END =====\n")
+
+        return refined or raw_skill_context
 
     def _generate_text_with_budget(
         self,
