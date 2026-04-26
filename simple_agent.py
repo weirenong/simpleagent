@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from dataclasses import dataclass, field
 from functools import partial
@@ -16,28 +17,31 @@ from typing import Any
 
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 import skills
+
+try:
+    from PIL import Image, ImageGrab
+except Exception:
+    Image = None
+    ImageGrab = None
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except Exception:
+    DND_FILES = None
+    TkinterDnD = None
 
 
 MODEL_LIBRARY = [
     {
-        "key": "qwen2.5-3b-instruct",
-        "id": "mlx-community/Qwen2.5-3B-Instruct-4bit",
+        "key": "qwen3-4b-thinking-2507",
+        "id": "lmstudio-community/Qwen3-4B-Thinking-2507-MLX-4bit",
         "category": "orchestrator",
         "runtime": "mlx-lm",
-        "specialty": "Primary orchestration model for routing, lightweight planning, and multi-step control flow.",
-        "why_selected": "MLX-ready 4-bit model for Apple Silicon orchestration with a good balance of speed and quality.",
-        "download_url": "https://huggingface.co/mlx-community/Qwen2.5-3B-Instruct-4bit/resolve/main/README.md",
-    },
-    {
-        "key": "qwen2.5-coder-7b-instruct",
-        "id": "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
-        "category": "specialist",
-        "runtime": "mlx-lm",
-        "specialty": "Specialised model for code generation and understanding.",
-        "why_selected": "Upgraded to the 7B 4-bit MLX coder model for much stronger local coding performance while staying around the upper end of a 4-5 GB memory budget on Apple Silicon.",
-        "download_url": "https://huggingface.co/mlx-community/Qwen2.5-Coder-7B-Instruct-4bit/resolve/main/README.md",
+        "specialty": "Primary thinking model for coding, reasoning, routing, lightweight planning, and multi-step control flow.",
+        "why_selected": "MLX-ready 4-bit Qwen3 thinking model for Apple Silicon, selected to replace the older Qwen2.5 text and coder models with a stronger under-6GB coding-focused reasoning model.",
+        "download_url": "https://huggingface.co/lmstudio-community/Qwen3-4B-Thinking-2507-MLX-4bit/resolve/main/README.md",
     },
     {
         "key": "qwen2.5-vl-3b-instruct",
@@ -91,7 +95,9 @@ class SimpleAgentGUI:
         self.models_dir.mkdir(exist_ok=True)
         self.chats_dir = Path("chats")
         self.chats_dir.mkdir(exist_ok=True)
-        self.active_prompt_model_key = "qwen2.5-3b-instruct"
+        self.temp_attachments_dir = Path("temp_attachments")
+        self.temp_attachments_dir.mkdir(exist_ok=True)
+        self.active_prompt_model_key = "qwen3-4b-thinking-2507"
         self.python_executable = sys.executable or "python"
         self.debug = True
         self.max_memory_items = 5
@@ -101,16 +107,52 @@ class SimpleAgentGUI:
         self.loading_frames = ["", ".", "..", "..."]
         self.loading_index = 0
         self.min_response_tokens = 256
-        self.default_response_tokens = 1024
-        self.max_response_tokens = 16384
+        self.default_response_tokens = 32768
+        self.max_response_tokens = 131072
+        self.unlimited_response_tokens = 0
         self.selected_response_tokens = self.default_response_tokens
         self.last_response_token_budget = self.default_response_tokens
+        self.last_thinking_text = ""
+        self.generation_started_at: float | None = None
+        self.last_response_seconds: float | None = None
+        self.console_window: tk.Toplevel | None = None
+        self.console_text: tk.Text | None = None
+        self.console_backlog: list[str] = []
+        self.pending_attachments: list[dict[str, str]] = []
+        self.image_attachment_extensions = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+        self.video_attachment_extensions = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+        self.vl_supported_extensions = self.image_attachment_extensions | self.video_attachment_extensions
+        self.text_attachment_extensions = {
+            ".txt", ".md", ".markdown", ".rst", ".log", ".csv", ".tsv",
+            ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env",
+            ".xml", ".html", ".htm", ".css", ".scss", ".sass", ".less",
+            ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+            ".py", ".pyw", ".ipynb", ".sql", ".sh", ".bash", ".zsh", ".fish",
+            ".bat", ".ps1", ".java", ".kt", ".kts", ".c", ".h", ".cpp", ".hpp", ".cc", ".cs",
+            ".go", ".rs", ".swift", ".php", ".rb", ".lua", ".r", ".m", ".scala", ".dart",
+            ".vue", ".svelte", ".astro", ".tex", ".bib", ".gitignore", ".dockerignore",
+            ".editorconfig", ".requirements", ".lock",
+        }
+
+        self.attachment_skill_map: dict[str, int] = {
+            **{extension: 4 for extension in self.image_attachment_extensions},
+            **{extension: 4 for extension in self.video_attachment_extensions},
+            **{extension: 5 for extension in self.text_attachment_extensions},
+        }
+
+        self.attachment_handler_map: dict[int, str] = {
+            4: "attachment_vision",
+            5: "text_file_reader",
+        }
 
         os.environ.setdefault("HF_HOME", str(self.models_dir / ".hf_cache"))
 
         self.state.add_log("INFO", "Simple Agent GUI initialised.")
 
-        self.root = tk.Tk()
+        if TkinterDnD is not None:
+            self.root = TkinterDnD.Tk()
+        else:
+            self.root = tk.Tk()
         self.root.title("Simple Agent")
         self.root.geometry("1280x820")
         self.root.minsize(960, 640)
@@ -182,10 +224,141 @@ class SimpleAgentGUI:
         file_menu.add_separator()
         file_menu.add_command(label="Download Models", command=self._download_text_models_async)
         file_menu.add_separator()
+        file_menu.add_command(label="Clear Temp Attachments", command=self._clear_temp_attachments)
+        file_menu.add_separator()
         file_menu.add_command(label="Quit", command=self.root.destroy)
 
+        view_menu = tk.Menu(menu_bar, tearoff=0)
+        view_menu.add_command(label="Show Console Output", command=self._show_console_window)
+        view_menu.add_command(label="Clear Console Output", command=self._clear_console_output)
+
         menu_bar.add_cascade(label="File", menu=file_menu)
+        menu_bar.add_cascade(label="View", menu=view_menu)
         self.root.config(menu=menu_bar)
+
+
+    def _show_console_window(self) -> None:
+        if self.console_window is not None and self.console_window.winfo_exists():
+            self.console_window.deiconify()
+            self.console_window.lift()
+            return
+
+        self.console_window = tk.Toplevel(self.root)
+        self.console_window.title("Console Output")
+        self.console_window.geometry("1050x650")
+        self.console_window.configure(bg="#111111")
+        self.console_window.protocol("WM_DELETE_WINDOW", self.console_window.withdraw)
+
+        frame = ttk.Frame(self.console_window)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        self.console_text = tk.Text(
+            frame,
+            wrap="word",
+            bg="#0f1115",
+            fg="#e6edf3",
+            insertbackground="#e6edf3",
+            relief="flat",
+            borderwidth=0,
+            padx=12,
+            pady=12,
+            font=("Courier", 11),
+            state="disabled",
+        )
+        self.console_text.grid(row=0, column=0, sticky="nsew")
+
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.console_text.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.console_text.configure(yscrollcommand=scrollbar.set)
+
+        if self.console_backlog:
+            self._append_console("".join(self.console_backlog), store=False)
+        else:
+            self._append_console("Console output window opened.\n", store=False)
+
+    def _clear_console_output(self) -> None:
+        self.console_backlog.clear()
+        if self.console_text is None:
+            return
+        self.console_text.configure(state="normal")
+        self.console_text.delete("1.0", tk.END)
+        self.console_text.configure(state="disabled")
+
+    def _clear_temp_attachments(self) -> None:
+        if self.is_generating:
+            messagebox.showinfo(
+                "Busy",
+                "Please wait for the current response to finish before clearing temp attachments.",
+            )
+            return
+
+        if not self.temp_attachments_dir.exists():
+            self.temp_attachments_dir.mkdir(exist_ok=True)
+            self._set_status("Temp attachments folder is already clean.")
+            return
+
+        files = [path for path in self.temp_attachments_dir.iterdir() if path.is_file()]
+        if not files:
+            self._set_status("Temp attachments folder is already clean.")
+            return
+
+        confirmed = messagebox.askyesno(
+            "Clear Temp Attachments",
+            f"Delete {len(files)} file(s) from temp_attachments? This cannot be undone.",
+        )
+        if not confirmed:
+            return
+
+        temp_root = self.temp_attachments_dir.resolve()
+        deleted_count = 0
+        failed_count = 0
+
+        for path in files:
+            try:
+                path.unlink()
+                deleted_count += 1
+            except Exception:
+                failed_count += 1
+
+        self.pending_attachments = [
+            attachment
+            for attachment in self.pending_attachments
+            if not str(attachment.get("path", "")).startswith(str(temp_root))
+        ]
+        self._render_attachment_bar()
+
+        if failed_count:
+            self._set_status(
+                f"Deleted {deleted_count} temp attachment(s), failed to delete {failed_count}."
+            )
+        else:
+            self._set_status(f"Deleted {deleted_count} temp attachment(s).")
+
+    def _append_console(self, text: str, store: bool = True) -> None:
+        if store:
+            self.console_backlog.append(text)
+            max_backlog_items = 300
+            if len(self.console_backlog) > max_backlog_items:
+                self.console_backlog = self.console_backlog[-max_backlog_items:]
+
+        if self.console_text is None:
+            return
+        if self.console_window is not None and not self.console_window.winfo_exists():
+            self.console_window = None
+            self.console_text = None
+            return
+
+        self.console_text.configure(state="normal")
+        self.console_text.insert(tk.END, text)
+        self.console_text.see(tk.END)
+        self.console_text.configure(state="disabled")
+
+    def _print_debug(self, text: str) -> None:
+        print(text)
+        if hasattr(self, "root"):
+            self.root.after(0, partial(self._append_console, text if text.endswith("\n") else text + "\n"))
 
     def _build_gui(self) -> None:
         self.root.columnconfigure(1, weight=1)
@@ -266,13 +439,12 @@ class SimpleAgentGUI:
         self.token_selector_label.grid(row=0, column=0, sticky="e")
 
         self.token_options = [
-            ("Minimal (256)", 256),
-            ("Small (512)", 512),
-            ("Medium (1024)", 1024),
-            ("Large (2048)", 2048),
-            ("XL (4096)", 4096),
-            ("XXL (8192)", 8192),
-            ("Max (16384)", 16384),
+            ("Small (8192)", 8192),
+            ("Medium (16384)", 16384),
+            ("Large (32768)", 32768),
+            ("Mega (65536)", 65536),
+            ("Ultra (131072)", 131072),
+            ("Unlimited", self.unlimited_response_tokens),
         ]
         self.token_option_map = {label: value for label, value in self.token_options}
         default_token_label = next(
@@ -434,6 +606,13 @@ class SimpleAgentGUI:
             spacing1=10,
             spacing3=16,
         )
+        self.transcript.tag_configure(
+            "horizontal_rule",
+            font=("Aptos", 15),
+            foreground="#5f6f64",
+            spacing1=10,
+            spacing3=12,
+        )
 
         self.composer = ttk.Frame(self.main, style="Composer.TFrame")
         self.composer.grid(row=2, column=0, sticky="ew", padx=20, pady=(6, 12))
@@ -456,11 +635,28 @@ class SimpleAgentGUI:
         self.input_box.bind("<Control-Return>", self._send_from_shortcut)
         self.input_box.bind("<Command-Return>", self._send_from_shortcut)
         self.input_box.bind("<KeyRelease>", self._auto_resize_input_box)
+        self.input_box.bind("<<Paste>>", self._handle_input_paste)
+        self._setup_attachment_drop_target()
         self.root.bind("<Configure>", self._on_root_resized)
         self.root.after(0, self._auto_resize_input_box)
 
+        self.attachment_bar = ttk.Frame(self.composer, style="Composer.TFrame")
+        self.attachment_bar.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.attachment_bar.columnconfigure(0, weight=1)
+
+        self.attachment_list_frame = ttk.Frame(self.attachment_bar, style="Composer.TFrame")
+        self.attachment_list_frame.grid(row=0, column=0, sticky="ew")
+
+        self.attach_button = ttk.Button(
+            self.attachment_bar,
+            text="Attach",
+            command=self._choose_attachment,
+            style="Primary.TButton",
+            width=8,
+        )
+        self.attach_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
         self.button_row = ttk.Frame(self.composer, style="Composer.TFrame")
-        self.button_row.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.button_row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         self.button_row.columnconfigure(0, weight=1)
 
         self.shortcut_label = ttk.Label(
@@ -485,10 +681,183 @@ class SimpleAgentGUI:
             style="Status.TLabel",
         )
         self.status_label.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
+        self._render_attachment_bar()
 
     def _send_from_shortcut(self, event: tk.Event) -> str:
         self._send_message()
         return "break"
+
+    def _setup_attachment_drop_target(self) -> None:
+        if DND_FILES is None or not hasattr(self.input_box, "drop_target_register"):
+            return
+        try:
+            self.input_box.drop_target_register(DND_FILES)
+            self.input_box.dnd_bind("<<Drop>>", self._handle_file_drop)
+        except Exception as exc:
+            self._log("WARN", f"Drag and drop unavailable: {exc}")
+
+    def _handle_file_drop(self, event: tk.Event) -> str:
+        raw_data = getattr(event, "data", "")
+        for file_path in self._parse_dropped_files(raw_data):
+            self._add_attachment(file_path)
+        return "break"
+
+    def _parse_dropped_files(self, raw_data: str) -> list[str]:
+        if not raw_data:
+            return []
+        try:
+            return [path for path in self.root.tk.splitlist(raw_data) if path]
+        except Exception:
+            return [raw_data.strip()] if raw_data.strip() else []
+
+    def _choose_attachment(self) -> None:
+        paths = filedialog.askopenfilenames(title="Choose attachments")
+        for file_path in paths:
+            self._add_attachment(file_path)
+
+    def _attachment_extension(self, path: Path) -> str:
+        suffix = path.suffix.lower()
+        if suffix:
+            return suffix
+        return path.name.lower()
+
+    def _skill_id_for_attachment_extension(self, extension: str) -> int | None:
+        return self.attachment_skill_map.get(extension.lower())
+
+    def _handler_for_attachment_skill(self, skill_id: int | None) -> str:
+        if skill_id is None:
+            return "pending"
+        return self.attachment_handler_map.get(skill_id, "pending")
+
+    def _add_attachment(self, file_path: str) -> None:
+        path = Path(file_path).expanduser()
+        if not path.exists() or not path.is_file():
+            self._set_status(f"Attachment not found: {file_path}")
+            return
+
+        resolved_path = str(path.resolve())
+        if any(item.get("path") == resolved_path for item in self.pending_attachments):
+            self._set_status(f"Attachment already added: {path.name}")
+            return
+
+        extension = self._attachment_extension(path)
+        skill_id = self._skill_id_for_attachment_extension(extension)
+        handler = self._handler_for_attachment_skill(skill_id)
+
+        self.pending_attachments.append(
+            {
+                "path": resolved_path,
+                "name": path.name,
+                "extension": extension,
+                "handler": handler,
+                "skill_id": skill_id,
+                "pinned": False,
+            }
+        )
+
+        self._render_attachment_bar()
+
+        if skill_id == 4:
+            self._set_status(f"Attached visual file for VL analysis: {path.name}")
+        else:
+            self._set_status(f"Attached file path only: {path.name}")
+
+    def _remove_attachment_at(self, index: int) -> None:
+        if 0 <= index < len(self.pending_attachments):
+            removed = self.pending_attachments.pop(index)
+            self._render_attachment_bar()
+            self._set_status(f"Removed attachment: {removed.get('name', 'file')}")
+
+    def _toggle_attachment_pin_at(self, index: int) -> None:
+        if 0 <= index < len(self.pending_attachments):
+            attachment = self.pending_attachments[index]
+            attachment["pinned"] = not bool(attachment.get("pinned", False))
+            self._render_attachment_bar()
+            state = "Pinned" if attachment.get("pinned") else "Unpinned"
+            self._set_status(f"{state} attachment: {attachment.get('name', 'file')}")
+
+    def _render_attachment_bar(self) -> None:
+        for child in self.attachment_list_frame.winfo_children():
+            child.destroy()
+
+        if not self.pending_attachments:
+            hint = ttk.Label(
+                self.attachment_list_frame,
+                text="Drag files here, paste an image, or use Attach.",
+                style="Meta.TLabel",
+            )
+            hint.grid(row=0, column=0, sticky="w")
+            return
+
+        for index, attachment in enumerate(self.pending_attachments):
+            chip = ttk.Frame(self.attachment_list_frame, style="Composer.TFrame")
+            chip.grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 8), pady=(0, 4))
+
+            skill_id = attachment.get("skill_id")
+            if skill_id == 4:
+                handler_label = "vision"
+            elif skill_id == 5:
+                handler_label = "text"
+            else:
+                handler_label = "path only"
+            pinned = bool(attachment.get("pinned", False))
+            pin_marker = " pinned" if pinned else ""
+            label = ttk.Label(
+                chip,
+                text=f"{attachment.get('name', 'file')} ({handler_label}{pin_marker})",
+                style="Meta.TLabel",
+            )
+            label.grid(row=0, column=0, sticky="w")
+
+            pin_button = ttk.Button(
+                chip,
+                text="Unpin" if pinned else "Pin",
+                width=6,
+                command=partial(self._toggle_attachment_pin_at, index),
+            )
+            pin_button.grid(row=0, column=1, sticky="w", padx=(4, 0))
+
+            remove_button = ttk.Button(
+                chip,
+                text="X",
+                width=3,
+                command=partial(self._remove_attachment_at, index),
+            )
+            remove_button.grid(row=0, column=2, sticky="w", padx=(4, 0))
+
+    def _handle_input_paste(self, event: tk.Event | None = None) -> str | None:
+        if ImageGrab is None or Image is None:
+            return None
+
+        try:
+            clipboard_content = ImageGrab.grabclipboard()
+        except Exception:
+            return None
+
+        if clipboard_content is None:
+            return None
+
+        if isinstance(clipboard_content, Image.Image):
+            saved_path = self._save_clipboard_image(clipboard_content)
+            self._add_attachment(str(saved_path))
+            return "break"
+
+        if isinstance(clipboard_content, list):
+            handled_any = False
+            for item in clipboard_content:
+                item_path = Path(str(item))
+                if item_path.exists() and item_path.is_file():
+                    self._add_attachment(str(item_path))
+                    handled_any = True
+            return "break" if handled_any else None
+
+        return None
+
+    def _save_clipboard_image(self, image: Any) -> Path:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        target_path = self.temp_attachments_dir / f"pasted_image_{timestamp}.png"
+        image.save(target_path, format="PNG")
+        return target_path
 
     def _block_transcript_edit(self, event: tk.Event | None = None) -> str:
         if event is not None:
@@ -557,8 +926,11 @@ class SimpleAgentGUI:
 
     def _log(self, level: str, message: str) -> None:
         self.state.add_log(level, message)
+        log_line = f"[{self.state.logs[-1].timestamp}] {level}: {message}"
         if self.debug:
-            print(f"[{self.state.logs[-1].timestamp}] {level}: {message}")
+            self._print_debug(log_line)
+        elif hasattr(self, "root"):
+            self.root.after(0, partial(self._append_console, log_line + "\n"))
 
     def _set_status(self, message: str) -> None:
         self.state.status = message
@@ -712,18 +1084,36 @@ class SimpleAgentGUI:
                 f"{message_count} messages • "
                 f"{memory_count}/{self.max_memory_items} short-term memory items • "
                 f"Model: {self.active_prompt_model_key} • "
-                f"Tokens: {self.selected_response_tokens}"
+                f"Tokens: {self._response_token_label()}"
             )
         )
         self._render_transcript(chat)
 
+    def _response_token_label(self) -> str:
+        if self.selected_response_tokens == self.unlimited_response_tokens:
+            return "Unlimited"
+        return str(self.selected_response_tokens)
+
+    def _format_token_budget(self, token_budget: int) -> str:
+        if token_budget == self.unlimited_response_tokens:
+            return "Unlimited"
+        return str(token_budget)
+
+    def _format_response_time(self, seconds: float | None) -> str:
+        if seconds is None:
+            return "Unknown"
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        minutes = int(seconds // 60)
+        remaining_seconds = seconds % 60
+        return f"{minutes}m {remaining_seconds:.1f}s"
 
     def _on_token_selection_changed(self, event: tk.Event | None = None) -> None:
         selected_label = self.token_selector_var.get().strip()
         selected_value = self.token_option_map.get(selected_label, self.default_response_tokens)
         self.selected_response_tokens = self._clamp_response_tokens(selected_value)
         self._open_current_chat()
-        self._set_status(f"Response size set to {self.selected_response_tokens} tokens")
+        self._set_status(f"Response size set to {self._response_token_label()} tokens")
 
     def _render_transcript(self, chat: dict[str, Any]) -> None:
         self.transcript.delete("1.0", tk.END)
@@ -742,9 +1132,33 @@ class SimpleAgentGUI:
                 tag = "user_name" if role == "user" else "assistant_name"
                 self.transcript.insert(tk.END, f"{name}\n", tag)
                 self._insert_formatted_message(message.get("content", "").strip())
+                self._insert_message_attachments(message.get("attachments", []))
                 self.transcript.insert(tk.END, "\n", "separator")
 
         self.transcript.see(tk.END)
+
+    def _insert_message_attachments(self, attachments: list[dict[str, str]]) -> None:
+        if not attachments:
+            return
+
+        self.transcript.insert(tk.END, "Attachments:\n", "heading4")
+        for attachment in attachments:
+            path = attachment.get("path", "")
+            name = attachment.get("name", Path(path).name if path else "file")
+            skill_id = attachment.get("skill_id")
+            if skill_id == 4:
+                handler_label = "vision"
+            elif skill_id == 5:
+                handler_label = "text"
+            else:
+                handler_label = "path only"
+
+            pinned = bool(attachment.get("pinned", False))
+            pin_marker = ", pinned" if pinned else ""
+            self.transcript.insert(tk.END, f"• {name} ({handler_label}{pin_marker}) - ", "bullet")
+            if path:
+                self._insert_clickable_link(path, f"file://{path}", "bullet")
+            self.transcript.insert(tk.END, "\n")
 
     def _insert_formatted_message(self, content: str) -> None:
         if not content:
@@ -794,23 +1208,28 @@ class SimpleAgentGUI:
                 index += 1
                 continue
 
+            if self._is_markdown_horizontal_rule(stripped):
+                self._insert_horizontal_rule()
+                index += 1
+                continue
+
             if stripped.startswith("#### "):
-                self.transcript.insert(tk.END, f"{stripped[5:].strip()}\n", "heading4")
+                self._insert_heading_line(stripped[5:].strip(), "heading4")
                 index += 1
                 continue
 
             if stripped.startswith("### "):
-                self.transcript.insert(tk.END, f"{stripped[4:].strip()}\n", "heading3")
+                self._insert_heading_line(stripped[4:].strip(), "heading3")
                 index += 1
                 continue
 
             if stripped.startswith("## "):
-                self.transcript.insert(tk.END, f"{stripped[3:].strip()}\n", "heading2")
+                self._insert_heading_line(stripped[3:].strip(), "heading2")
                 index += 1
                 continue
 
             if stripped.startswith("# "):
-                self.transcript.insert(tk.END, f"{stripped[2:].strip()}\n", "heading1")
+                self._insert_heading_line(stripped[2:].strip(), "heading1")
                 index += 1
                 continue
 
@@ -848,6 +1267,19 @@ class SimpleAgentGUI:
             if code_text:
                 self.transcript.insert(tk.END, f"{code_text}\n", "code_block")
 
+
+    def _is_markdown_horizontal_rule(self, stripped_line: str) -> bool:
+        compact = stripped_line.replace(" ", "")
+        return bool(re.fullmatch(r"(-{3,}|_{3,}|\*{3,})", compact))
+
+    def _insert_horizontal_rule(self) -> None:
+        self.transcript.insert(tk.END, "\n", "body")
+        self.transcript.insert(tk.END, "─" * 72 + "\n", "horizontal_rule")
+        self.transcript.insert(tk.END, "\n", "body")
+
+    def _insert_heading_line(self, text: str, heading_tag: str) -> None:
+        cleaned_text = self._normalize_inline_markdown(text)
+        self.transcript.insert(tk.END, f"{cleaned_text}\n", heading_tag)
 
     def _collect_markdown_table(self, lines: list[str], start_index: int) -> tuple[list[list[str]], int] | None:
         if start_index + 1 >= len(lines):
@@ -1096,12 +1528,26 @@ class SimpleAgentGUI:
 
         self.input_box.delete("1.0", tk.END)
         self._auto_resize_input_box()
-        chat.setdefault("messages", []).append({"role": "user", "content": prompt})
+        attachments_snapshot = [dict(item) for item in self.pending_attachments]
+        chat.setdefault("messages", []).append(
+            {
+                "role": "user",
+                "content": prompt,
+                "attachments": attachments_snapshot,
+            }
+        )
+        self.pending_attachments = [
+            attachment for attachment in self.pending_attachments
+            if bool(attachment.get("pinned", False))
+        ]
+        self._render_attachment_bar()
         self._save_chat(chat)
         self._refresh_chat_list()
         self._open_current_chat()
 
         self.is_generating = True
+        self.generation_started_at = time.perf_counter()
+        self.last_response_seconds = None
         self.new_chat_button.config(state="disabled")
         self._start_loading_animation()
 
@@ -1109,7 +1555,7 @@ class SimpleAgentGUI:
         chat_id = chat["id"]
         thread = threading.Thread(
             target=self._generate_response_worker,
-            args=(chat_id, prompt, memory_snapshot),
+            args=(chat_id, prompt, memory_snapshot, attachments_snapshot),
             daemon=True,
         )
         thread.start()
@@ -1119,9 +1565,10 @@ class SimpleAgentGUI:
         chat_id: str,
         prompt: str,
         memory_snapshot: list[dict[str, str]],
+        attachments_snapshot: list[dict[str, str]],
     ) -> None:
         try:
-            response = self._run_prompt(prompt, memory_snapshot)
+            response = self._run_prompt(prompt, memory_snapshot, attachments_snapshot)
             title = ""
             chat = self._chat_by_id(chat_id)
             if chat is not None and self._should_generate_title(chat):
@@ -1150,6 +1597,9 @@ class SimpleAgentGUI:
         self._stop_loading_animation()
         self.send_button.config(state="normal", text="Send")
         self.new_chat_button.config(state="normal")
+        if self.generation_started_at is not None:
+            self.last_response_seconds = time.perf_counter() - self.generation_started_at
+            self.generation_started_at = None
 
         chat = self._chat_by_id(chat_id)
         if chat is None:
@@ -1163,7 +1613,10 @@ class SimpleAgentGUI:
             self._save_chat(chat)
             self._refresh_chat_list()
             self._open_current_chat()
-            self._set_status(f"Generation failed. Last token budget: {self.last_response_token_budget}")
+            self._set_status(
+                f"Generation failed. Last token budget: {self._format_token_budget(self.last_response_token_budget)} • "
+                f"Time: {self._format_response_time(self.last_response_seconds)}"
+            )
             return
 
         chat.setdefault("messages", []).append({"role": "assistant", "content": response})
@@ -1176,7 +1629,10 @@ class SimpleAgentGUI:
         self._refresh_chat_list()
         if self.state.current_chat_id == chat_id:
             self._open_current_chat()
-        self._set_status(f"Response generated. Tokens used allowance: {self.last_response_token_budget}")
+        self._set_status(
+            f"Response generated. Tokens used allowance: {self._format_token_budget(self.last_response_token_budget)} • "
+            f"Time: {self._format_response_time(self.last_response_seconds)}"
+        )
 
     def _chat_by_id(self, chat_id: str) -> dict[str, Any] | None:
         for chat in self.state.chats:
@@ -1189,7 +1645,179 @@ class SimpleAgentGUI:
         user_messages = [m for m in chat.get("messages", []) if m.get("role") == "user"]
         return title in {"", "new chat"} and len(user_messages) == 1
 
-    def _run_prompt(self, prompt: str, memory_items: list[dict[str, str]]) -> str:
+    def _build_datetime_context(self) -> str:
+        now = datetime.now().astimezone()
+        return (
+            "Current date/time context:\n"
+            f"- Local date and time: {now.strftime('%A, %d %B %Y, %H:%M:%S %Z')}\n"
+            f"- ISO timestamp: {now.isoformat(timespec='seconds')}\n"
+            "Use this as today's date/time when interpreting relative dates like today, tomorrow, yesterday, this week, this month, or this year."
+        )
+
+    def _build_attachment_context(self, prompt: str, attachments: list[dict[str, str]]) -> str:
+        if not attachments:
+            return ""
+
+        context_parts: list[str] = []
+        pending_files: list[str] = []
+
+        for attachment in attachments:
+            path = attachment.get("path", "")
+            name = attachment.get("name", Path(path).name if path else "file")
+            extension = attachment.get("extension", Path(path).suffix.lower() if path else "")
+            skill_id = attachment.get("skill_id")
+
+            if skill_id == 4 and path:
+                vl_result = self._run_vl_attachment_analysis(prompt, path)
+                if vl_result:
+                    context_parts.append(f"Vision attachment analysis for {name}:\n{vl_result}")
+                else:
+                    pending_files.append(f"{name} ({path}) - vision analysis unavailable")
+            elif skill_id == 5 and path:
+                text_result = self._read_text_attachment(path)
+                if text_result:
+                    context_parts.append(f"Text attachment content for {name}:\n{text_result}")
+                else:
+                    pending_files.append(f"{name} ({path}) - text file could not be read")
+            else:
+                handler = attachment.get("handler", "pending")
+                pending_files.append(
+                    f"{name} ({path}) - attached path only; no automatic analysis implemented yet for "
+                    f"{extension or 'unknown extension'} using handler {handler}"
+                )
+
+        if pending_files:
+            context_parts.append(
+                "Attached files without automatic analysis:\n" + "\n".join(f"- {item}" for item in pending_files)
+            )
+
+        if not context_parts:
+            return ""
+
+        return "Attachment context:\n" + "\n\n".join(context_parts)
+
+    def _read_text_attachment(self, file_path: str, max_chars: int | None = None) -> str:
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            return ""
+
+        try:
+            file_size = path.stat().st_size
+        except Exception:
+            file_size = 0
+
+        encodings = ("utf-8", "utf-8-sig", "utf-16", "latin-1")
+        content = ""
+        used_encoding = ""
+
+        for encoding in encodings:
+            try:
+                content = path.read_text(encoding=encoding)
+                used_encoding = encoding
+                break
+            except UnicodeDecodeError:
+                continue
+            except Exception as exc:
+                return f"Text read failed: {exc}"
+
+        if not content:
+            return ""
+
+        truncated = max_chars is not None and len(content) > max_chars
+        if truncated:
+            content = content[:max_chars]
+
+        metadata = (
+            f"Path: {path}\n"
+            f"Extension: {self._attachment_extension(path)}\n"
+            f"Size bytes: {file_size}\n"
+            f"Encoding used: {used_encoding or 'unknown'}\n"
+            f"Truncated: {'yes' if truncated else 'no'}\n"
+            "--- file content start ---\n"
+        )
+
+        footer = "\n--- file content end ---"
+        if truncated:
+            footer = "\n--- file content truncated because it exceeded the text attachment limit ---" + footer
+
+        return metadata + content + footer
+
+    def _run_vl_attachment_analysis(self, user_prompt: str, file_path: str) -> str:
+        model = self._resolve_model("qwen2.5-vl-3b-instruct")
+        if model is None or model.get("runtime") != "mlx-vlm":
+            return ""
+
+        model_dir = self.models_dir / model["key"]
+        local_model_path = model_dir / "model"
+        if not local_model_path.exists():
+            return ""
+
+        extension = Path(file_path).suffix.lower()
+        media_arg = "--video" if extension in self.video_attachment_extensions else "--image"
+
+        vl_prompt = (
+            "Analyse this attachment for the user's request. "
+            "Extract visible text, describe important visual details, and mention anything relevant to the prompt. "
+            "Be concise and factual.\n\n"
+            f"User prompt:\n{user_prompt}"
+        )
+
+        command = [
+            self.python_executable,
+            "-m",
+            "mlx_vlm",
+            "generate",
+            "--model",
+            str(local_model_path),
+            media_arg,
+            file_path,
+            "--prompt",
+            vl_prompt,
+            "--max-tokens",
+            "2048",
+        ]
+
+        env = os.environ.copy()
+        env["HF_HUB_OFFLINE"] = "1"
+        env["TRANSFORMERS_OFFLINE"] = "1"
+
+        try:
+            self.root.after(0, lambda: self._set_loading_base("Analysing attachment"))
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+        except Exception as exc:
+            return f"Vision analysis failed: {exc}"
+
+        if result.returncode != 0:
+            error_output = result.stderr.strip() or result.stdout.strip() or "Unknown VL error"
+            return f"Vision analysis failed: {error_output}"
+
+        output = result.stdout.strip()
+
+        if self.debug:
+            raw_debug_output = (
+                "\n===== VL MODEL OUTPUT START =====\n"
+                f"Attachment: {file_path}\n"
+                f"{output}\n"
+                "===== VL MODEL OUTPUT END =====\n"
+            )
+            self._print_debug(raw_debug_output)
+
+        cleaned_output = self._strip_mlx_output_headers(output)
+        cleaned_output = self._remove_hidden_prompt_thinking_leak(cleaned_output)
+        return cleaned_output.strip()
+
+    def _run_prompt(
+        self,
+        prompt: str,
+        memory_items: list[dict[str, str]],
+        attachments: list[dict[str, str]] | None = None,
+    ) -> str:
         model = self._resolve_model(self.active_prompt_model_key)
         if model is None:
             raise RuntimeError(f"Prompt model not found: {self.active_prompt_model_key}")
@@ -1209,39 +1837,41 @@ class SimpleAgentGUI:
         memory_block = self._build_memory_block(memory_items)
 
         self.root.after(0, lambda: self._set_loading_base("Routing skills"))
-        skill_ids = self._decide_skill_ids(prompt, memory_items)
+        skill_ids = self._decide_skill_ids(prompt, memory_items, attachments or [])
 
         self.root.after(0, lambda: self._set_loading_base("Executing skills"))
-        raw_skill_context = self._execute_skills(skill_ids, prompt)
+        skill_context = self._execute_skills(skill_ids, prompt)
 
-        self.root.after(0, lambda: self._set_loading_base("Extracting relevant tool info"))
-        skill_context = self._refine_skill_context(
-            prompt=prompt,
-            raw_skill_context=raw_skill_context,
-            local_model_path=local_model_path,
-            env={
-                **os.environ.copy(),
-                "HF_HUB_OFFLINE": "1",
-                "TRANSFORMERS_OFFLINE": "1",
-            },
-        )
+        self.root.after(0, lambda: self._set_loading_base("Handling attachments"))
+        attachment_context = self._build_attachment_context(prompt, attachments or [])
 
         self.root.after(0, lambda: self._set_loading_base("Building prompt"))
-        prompt_parts: list[str] = []
+        prompt_parts: list[str] = [self._build_datetime_context()]
         if memory_block:
             prompt_parts.append(memory_block)
         if skill_context:
             prompt_parts.append(skill_context)
+
+        if attachment_context:
+            prompt_parts.append(attachment_context)
+
         if skill_context:
             prompt_parts.append(
-                "The tool information below has already been filtered for relevance to the user's original request. "
-                "Use it as supporting context to answer the user's actual question directly. "
-                "Do not merely summarise the tool information. "
-                "If the filtered tool information is incomplete, clearly say what is missing."
+                "Use the skill results as grounding context. "
+                "Do not invent facts that are not present in the skill results. "
+                "If the skill results only provide source pages but not the exact requested answer, say that and point the user to the best source URLs."
+            )
+
+        if attachment_context:
+            prompt_parts.append(
+                "Use the attachment analysis as grounding context. "
+                "If an attached file was marked path only, acknowledge that it was attached but not automatically analysed yet."
             )
         prompt_parts.append(f"Current user prompt:\n{prompt}")
         final_prompt = "\n\n".join(prompt_parts)
-        response_token_budget = self._clamp_response_tokens(self.selected_response_tokens)
+        response_token_budget = self.selected_response_tokens
+        if response_token_budget != self.unlimited_response_tokens:
+            response_token_budget = self._clamp_response_tokens(response_token_budget)
         self.last_response_token_budget = response_token_budget
 
         env = os.environ.copy()
@@ -1256,64 +1886,15 @@ class SimpleAgentGUI:
             env=env,
         )
 
-    def _refine_skill_context(
-        self,
-        prompt: str,
-        raw_skill_context: str,
-        local_model_path: Path,
-        env: dict[str, str],
-    ) -> str:
-        if not raw_skill_context.strip():
-            return ""
-
-        self.root.after(0, lambda: self._set_loading_base("Filtering tool results"))
-
-        refinement_prompt = (
-            "You are a retrieval filtering layer for a local AI agent.\n"
-            "Your job is NOT to answer the user yet.\n"
-            "Your job is to read raw tool results and extract only the information that helps answer the user's original request.\n\n"
-            "Rules:\n"
-            "1. Focus on the user's original intent.\n"
-            "2. Keep concrete facts, names, numbers, lists, dates, claims, and source URLs.\n"
-            "3. Remove irrelevant search-result descriptions, navigation text, boilerplate, repeated links, and generic summaries.\n"
-            "4. If the raw tool results do not contain the answer, say what is missing.\n"
-            "5. Do not invent information.\n"
-            "6. Return compact grounding notes only.\n\n"
-            f"Original user request:\n{prompt}\n\n"
-            f"Raw tool results:\n{raw_skill_context}\n\n"
-            "Filtered relevant tool information:"
-        )
-
-        try:
-            refined = self._generate_text_with_budget(
-                local_model_path=local_model_path,
-                prompt=refinement_prompt,
-                max_tokens=min(1024, self._clamp_response_tokens(self.selected_response_tokens)),
-                env=env,
-            )
-        except Exception as exc:
-            if self.debug:
-                print("\n===== TOOL RESULT REFINEMENT FAILED =====")
-                print(exc)
-                print("Falling back to raw skill context.")
-                print("===== TOOL RESULT REFINEMENT FAILED END =====\n")
-            return raw_skill_context
-
-        refined = refined.strip()
-        if self.debug:
-            print("\n===== REFINED TOOL CONTEXT START =====")
-            print(refined if refined else "<empty>")
-            print("===== REFINED TOOL CONTEXT END =====\n")
-
-        return refined or raw_skill_context
-
     def _generate_text_with_budget(
         self,
         local_model_path: Path,
         prompt: str,
         max_tokens: int,
         env: dict[str, str],
+        show_thinking: bool = True,
     ) -> str:
+        effective_prompt = prompt if show_thinking else self._build_no_think_prompt(prompt)
         command = [
             self.python_executable,
             "-m",
@@ -1322,10 +1903,11 @@ class SimpleAgentGUI:
             "--model",
             str(local_model_path),
             "--prompt",
-            prompt,
-            "--max-tokens",
-            str(max_tokens),
+            effective_prompt,
         ]
+
+        if max_tokens > 0:
+            command.extend(["--max-tokens", str(max_tokens)])
 
         result = subprocess.run(
             command,
@@ -1342,13 +1924,22 @@ class SimpleAgentGUI:
         output = result.stdout.strip()
 
         if self.debug:
-            print("\n===== RAW MODEL OUTPUT START =====")
-            print(output)
-            print("===== RAW MODEL OUTPUT END =====\n")
+            raw_debug_output = (
+                "\n===== RAW MODEL OUTPUT START =====\n"
+                f"{output}\n"
+                "===== RAW MODEL OUTPUT END =====\n"
+            )
+            self._print_debug(raw_debug_output)
 
         if not output:
             raise RuntimeError("Prompt execution returned no output.")
 
+        visible_response = self._extract_visible_response(output, show_thinking=show_thinking)
+        if not visible_response:
+            raise RuntimeError("Prompt execution returned no visible response.")
+        return visible_response
+
+    def _strip_mlx_output_headers(self, output: str) -> str:
         hidden_prefixes = (
             "==========",
             "Prompt:",
@@ -1358,12 +1949,150 @@ class SimpleAgentGUI:
         visible_lines = [
             line for line in output.splitlines() if not line.startswith(hidden_prefixes)
         ]
-        visible_response = "\n".join(visible_lines).strip()
-        if not visible_response:
-            raise RuntimeError("Prompt execution returned no visible response.")
-        return visible_response
+        return "\n".join(visible_lines).strip()
 
-    def _decide_skill_ids(self, prompt: str, memory_items: list[dict[str, str]]) -> list[int]:
+    def _extract_visible_response(self, output: str, show_thinking: bool = True) -> str:
+        cleaned_output = self._strip_mlx_output_headers(output)
+        answer, thinking = self._split_thinking_output(cleaned_output)
+        self.last_thinking_text = thinking
+
+        if thinking and show_thinking:
+            thinking_preview = self._thinking_preview(thinking)
+            if thinking_preview:
+                self.root.after(0, partial(self._set_loading_base, thinking_preview))
+
+        if not show_thinking:
+            answer = self._remove_hidden_prompt_thinking_leak(answer)
+
+        return answer.strip()
+
+    def _build_no_think_prompt(self, prompt: str) -> str:
+        return (
+            f"{prompt.strip()}\n\n"
+            "System instruction for this internal helper call:\n"
+            "Do not output reasoning, analysis, planning notes, or <think> tags. "
+            "Return only the final requested value.\n"
+            "/no_think"
+        )
+
+    def _remove_hidden_prompt_thinking_leak(self, text: str) -> str:
+        cleaned = text.strip()
+        if not cleaned:
+            return ""
+
+        cleaned = re.sub(r"(?is)<think>.*?</think>", "", cleaned).strip()
+        cleaned = re.sub(r"(?is)^.*?</think>", "", cleaned).strip()
+
+        leak_patterns = [
+            r"(?is)^okay,?\s+the user.*?(?:\n\s*\n|$)",
+            r"(?is)^let me .*?(?:\n\s*\n|$)",
+            r"(?is)^i need to .*?(?:\n\s*\n|$)",
+            r"(?is)^we need to .*?(?:\n\s*\n|$)",
+            r"(?is)^first,.*?(?:\n\s*\n|$)",
+            r"(?is)^final response:?",
+        ]
+        for pattern in leak_patterns:
+            cleaned = re.sub(pattern, "", cleaned).strip()
+
+        lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+        if len(lines) > 1:
+            filtered_lines = [
+                line for line in lines
+                if not re.match(r"(?i)^(okay|let me|i need|we need|first|then|wait|make sure|the user)", line)
+            ]
+            if filtered_lines:
+                cleaned = "\n".join(filtered_lines).strip()
+
+        return cleaned
+
+    def _split_thinking_output(self, text: str) -> tuple[str, str]:
+        if not text:
+            return "", ""
+
+        think_start_match = re.search(r"<think>", text, flags=re.IGNORECASE)
+        think_end_match = re.search(r"</think>", text, flags=re.IGNORECASE)
+
+        if think_end_match:
+            thinking = ""
+            if think_start_match and think_start_match.start() < think_end_match.start():
+                thinking = text[think_start_match.end():think_end_match.start()].strip()
+            else:
+                thinking = text[:think_end_match.start()].strip()
+            answer = text[think_end_match.end():].strip()
+            return answer, thinking
+
+        if think_start_match:
+            thinking = text[think_start_match.end():].strip()
+            return "", thinking
+
+        if self._looks_like_unclosed_thinking(text):
+            return "", text.strip()
+
+        return text.strip(), ""
+
+    def _looks_like_unclosed_thinking(self, text: str) -> bool:
+        compact = text.strip().lower()
+        if not compact:
+            return False
+
+        thinking_starts = (
+            "okay, the user",
+            "okay, user",
+            "hmm, the user",
+            "hmm, user",
+            "let me",
+            "i need to",
+            "we need to",
+            "first,",
+        )
+        if compact.startswith(thinking_starts):
+            return True
+
+        thinking_markers = (
+            "the user wants",
+            "the user is asking",
+            "i should",
+            "i need",
+            "let me",
+            "final response",
+        )
+        marker_count = sum(1 for marker in thinking_markers if marker in compact[:600])
+        return marker_count >= 2
+
+    def _thinking_preview(self, thinking: str) -> str:
+        if not thinking:
+            return "Thinking"
+
+        compact = re.sub(r"\s+", " ", thinking).strip()
+        compact = re.sub(r"^okay,?\s*", "", compact, flags=re.IGNORECASE)
+        if not compact:
+            return "Thinking"
+
+        max_length = 80
+        if len(compact) > max_length:
+            compact = compact[: max_length - 3].rstrip() + "..."
+        return f"Thinking: {compact}"
+
+    def _attachment_skill_ids(self, attachments: list[dict[str, str]] | None = None) -> list[int]:
+        attachment_items = attachments if attachments is not None else self.pending_attachments
+        skill_ids: list[int] = []
+
+        for attachment in attachment_items:
+            skill_id = attachment.get("skill_id")
+            if isinstance(skill_id, int):
+                skill_ids.append(skill_id)
+
+        return list(dict.fromkeys(skill_ids))
+
+    def _current_prompt_has_vl_attachments(self, attachments: list[dict[str, str]] | None = None) -> bool:
+        return 4 in self._attachment_skill_ids(attachments)
+
+    def _decide_skill_ids(
+        self,
+        prompt: str,
+        memory_items: list[dict[str, str]],
+        attachments: list[dict[str, str]] | None = None,
+    ) -> list[int]:
         model = self._resolve_model(self.active_prompt_model_key)
         if model is None or model["runtime"] != "mlx-lm":
             return []
@@ -1380,6 +2109,8 @@ class SimpleAgentGUI:
 
         if self._prompt_contains_url(prompt):
             deterministic_ids.append(2)
+
+        deterministic_ids.extend(self._attachment_skill_ids(attachments))
 
         if deterministic_ids:
             selected_ids = list(dict.fromkeys(deterministic_ids))
@@ -1400,6 +2131,8 @@ class SimpleAgentGUI:
             "Return only comma-separated integers, with no explanation.\n"
             "Use 1 only when the user explicitly asks to search, look up, browse, get latest/current/today information, check prices, check news, or verify facts online.\n"
             "Use 2 only when the user provides a URL/link and asks about its content, wants it summarised, or wants information extracted from it.\n"
+            "Use 4 when the user has attached an image/video or asks to analyse an attached visual file.\n"
+            "Use 5 when the user has attached a readable text/code/config file such as txt, md, py, json, csv, html, css, js, sql, sh, yaml, or similar.\n"
             "Use 0 for normal conversation, opinions, follow-up questions, local code edits, UI changes, reasoning, writing, summarising, or anything answerable from the existing chat.\n"
             "For short follow-ups like 'what do you think', 'explain more', 'continue', or 'is it bullish or bearish', choose 0 unless the user also explicitly asks to search online.\n"
             "When unsure, choose 0.\n\n"
@@ -1417,8 +2150,9 @@ class SimpleAgentGUI:
             decision_text = self._generate_text_with_budget(
                 local_model_path=local_model_path,
                 prompt=decision_prompt,
-                max_tokens=32,
+                max_tokens=self.default_response_tokens,
                 env=env,
+                show_thinking=False,
             )
         except Exception:
             return []
@@ -1450,19 +2184,24 @@ class SimpleAgentGUI:
             1: "internet_search",
             2: "scrape_url",
             3: "memory_rag",
+            4: "attachment_vision",
+            5: "text_file_reader",
         }
         readable_skills = [skill_catalog.get(skill_id, f"unknown_{skill_id}") for skill_id in skill_ids]
         if not readable_skills:
             readable_skills = ["no_skill"]
 
-        print("\n===== SKILL ROUTER DECISION START =====")
-        print(f"Source: {source}")
-        print(f"Prompt: {prompt}")
-        print(f"Selected skill ids: {skill_ids if skill_ids else [0]}")
-        print(f"Selected skills: {', '.join(readable_skills)}")
-        print("Raw/router decision:")
-        print(raw_decision)
-        print("===== SKILL ROUTER DECISION END =====\n")
+        debug_text = (
+            "\n===== SKILL ROUTER DECISION START =====\n"
+            f"Source: {source}\n"
+            f"Prompt: {prompt}\n"
+            f"Selected skill ids: {skill_ids if skill_ids else [0]}\n"
+            f"Selected skills: {', '.join(readable_skills)}\n"
+            "Raw/router decision:\n"
+            f"{raw_decision}\n"
+            "===== SKILL ROUTER DECISION END =====\n"
+        )
+        self._print_debug(debug_text)
 
     def _prompt_contains_url(self, prompt: str) -> bool:
         return re.search(r"https?://[^\s)\]>\"']+", prompt) is not None
@@ -1574,6 +2313,21 @@ class SimpleAgentGUI:
             "past messages": 3,
             "previous messages": 3,
             "old messages": 3,
+            "attachment_vision": 4,
+            "attachment vision": 4,
+            "vision attachment": 4,
+            "image attachment": 4,
+            "attached image": 4,
+            "attached video": 4,
+            "visual file": 4,
+            "text_file_reader": 5,
+            "text file reader": 5,
+            "text file": 5,
+            "read text file": 5,
+            "code file": 5,
+            "attached text": 5,
+            "attached code": 5,
+            "markdown file": 5,
         }
 
         for name, skill_id in skill_name_map.items():
@@ -1625,8 +2379,9 @@ class SimpleAgentGUI:
             query = self._generate_text_with_budget(
                 local_model_path=local_model_path,
                 prompt=query_prompt,
-                max_tokens=64,
+                max_tokens=self.default_response_tokens,
                 env=env,
+                show_thinking=False,
             )
         except Exception:
             return prompt
@@ -1655,20 +2410,58 @@ class SimpleAgentGUI:
                 elif skill_id == 3:
                     skill_input = prompt
                     self.root.after(0, lambda: self._set_loading_base("Searching memory"))
+                elif skill_id == 4:
+                    self.root.after(0, lambda: self._set_loading_base("Preparing attachment analysis"))
+                    result = "Attachment vision analysis will run through the local VL attachment pipeline."
+                    if self.debug:
+                        debug_text = (
+                            "\n===== SKILL EXECUTION START =====\n"
+                            f"Skill id: {skill_id}\n"
+                            "Skill input: attached visual files\n"
+                            "Skill output:\n"
+                            f"{result}\n"
+                            "===== SKILL EXECUTION END =====\n"
+                        )
+                        self._print_debug(debug_text)
+                    outputs.append(f"Skill {skill_id} output:\n{result}")
+                    continue
+                elif skill_id == 5:
+                    self.root.after(0, lambda: self._set_loading_base("Preparing text file reading"))
+                    result = "Text file reading will run through the local attachment text pipeline."
+
+                    if self.debug:
+                        debug_text = (
+                            "\n===== SKILL EXECUTION START =====\n"
+                            f"Skill id: {skill_id}\n"
+                            "Skill input: attached text/code files\n"
+                            "Skill output:\n"
+                            f"{result}\n"
+                            "===== SKILL EXECUTION END =====\n"
+                        )
+                        self._print_debug(debug_text)
+
+                    outputs.append(f"Skill {skill_id} output:\n{result}")
+                    continue
 
                 if self.debug:
-                    print("\n===== SKILL EXECUTION START =====")
-                    print(f"Skill id: {skill_id}")
-                    print(f"Skill input: {skill_input}")
+                    debug_text = (
+                        "\n===== SKILL EXECUTION START =====\n"
+                        f"Skill id: {skill_id}\n"
+                        f"Skill input: {skill_input}\n"
+                    )
+                    self._print_debug(debug_text)
 
                 current_chat = self._get_current_chat()
                 current_memory = current_chat.get("memory", []) if current_chat is not None else []
                 result = skills.execute_skill(skill_id, skill_input, current_memory)
 
                 if self.debug:
-                    print("Skill output:")
-                    print(result if result.strip() else "<empty>")
-                    print("===== SKILL EXECUTION END =====\n")
+                    debug_text = (
+                        "Skill output:\n"
+                        f"{result if result.strip() else '<empty>'}\n"
+                        "===== SKILL EXECUTION END =====\n"
+                    )
+                    self._print_debug(debug_text)
             except Exception as exc:
                 result = f"Skill {skill_id} failed: {exc}"
 
@@ -1677,15 +2470,19 @@ class SimpleAgentGUI:
 
         if not outputs:
             if self.debug:
-                print("\n===== SKILL EXECUTION SUMMARY =====")
-                print("No skill outputs were added to the final prompt.")
-                print("===== SKILL EXECUTION SUMMARY END =====\n")
+                debug_text = (
+                    "\n===== SKILL EXECUTION SUMMARY =====\n"
+                    "No skill outputs were added to the final prompt.\n"
+                    "===== SKILL EXECUTION SUMMARY END =====\n"
+                )
+                self._print_debug(debug_text)
             return ""
 
         return "Skill results to use as grounding context:\n" + "\n\n".join(outputs)
 
-
     def _clamp_response_tokens(self, value: int) -> int:
+        if value == self.unlimited_response_tokens:
+            return value
         return max(self.min_response_tokens, min(self.max_response_tokens, value))
 
     def _build_memory_block(self, memory_items: list[dict[str, str]]) -> str:
@@ -1719,10 +2516,13 @@ class SimpleAgentGUI:
             max_tokens="64",
         )
 
-        if not user_summary:
-            user_summary = user_prompt.strip().replace("\n", " ")[:200]
-        if not assistant_summary:
-            assistant_summary = model_response.strip().replace("\n", " ")[:200]
+        user_summary = self._clean_hidden_value(user_summary)
+        assistant_summary = self._clean_hidden_value(assistant_summary)
+
+        if not user_summary or self._summary_looks_bad(user_summary):
+            user_summary = self._fallback_user_memory_summary(user_prompt)
+        if not assistant_summary or self._summary_looks_bad(assistant_summary):
+            assistant_summary = self._fallback_assistant_memory_summary(model_response)
 
         memory = chat.setdefault("memory", [])
         memory.append(
@@ -1742,11 +2542,139 @@ class SimpleAgentGUI:
                 "Use 2 to 5 words only. "
                 "Return title only, with no punctuation except hyphens if absolutely needed."
             ),
-            max_tokens="16",
+            max_tokens="256",
         )
-        title = title.strip().replace("\n", " ")
-        title = re.sub(r"\s+", " ", title)
+        title = self._clean_hidden_value(title)
+        if not title or self._title_looks_bad(title):
+            title = self._fallback_chat_title(first_prompt)
         return title[:60] or "New Chat"
+
+    def _title_looks_bad(self, title: str) -> bool:
+        cleaned = title.strip()
+        if not cleaned:
+            return True
+        lowered = cleaned.lower()
+        bad_markers = (
+            "the user",
+            "hmm",
+            "okay",
+            "looking at",
+            "options could be",
+            "title",
+            "return only",
+            "thinking",
+        )
+        if any(marker in lowered for marker in bad_markers):
+            return True
+        if len(cleaned.split()) > 6:
+            return True
+        if len(cleaned) > 60:
+            return True
+        return False
+
+    def _clean_hidden_value(self, text: str) -> str:
+        cleaned = self._remove_hidden_prompt_thinking_leak(text)
+        cleaned = cleaned.strip().replace("\n", " ")
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = cleaned.strip("`'\".,:;!?- ")
+        return cleaned
+
+    def _fallback_chat_title(self, text: str) -> str:
+        cleaned = re.sub(r"https?://\S+", "", text)
+        cleaned = re.sub(r"[^a-zA-Z0-9\s-]", "", cleaned)
+        words = [word for word in cleaned.split() if len(word) > 1]
+        stop_words = {
+            "what", "your", "name", "and", "can", "you", "the", "for", "with",
+            "this", "that", "from", "into", "about", "explain", "detail", "please",
+        }
+        meaningful_words = [word for word in words if word.lower() not in stop_words]
+        selected_words = meaningful_words[:5] or words[:5]
+        if not selected_words:
+            return "New Chat"
+        return " ".join(word.capitalize() for word in selected_words[:5])
+
+    def _summary_looks_bad(self, text: str) -> bool:
+        cleaned = text.strip()
+        if not cleaned:
+            return True
+
+        lowered = cleaned.lower()
+        thinking_leaks = (
+            "okay, the user",
+            "hmm, the user",
+            "looking at the text",
+            "i need to",
+            "i should",
+            "let me",
+            "the provided text",
+        )
+        if any(leak in lowered for leak in thinking_leaks):
+            return True
+
+        if len(cleaned) > 260:
+            return True
+
+        markdown_or_copy_markers = ("###", "####", "---", "**", "```", "🔍", "✅", "🛠️")
+        if any(marker in cleaned for marker in markdown_or_copy_markers):
+            return True
+
+        return False
+
+    def _fallback_user_memory_summary(self, text: str, max_chars: int = 260) -> str:
+        cleaned = self._strip_thinking_for_storage(text)
+        cleaned = self._plain_text_compact(cleaned)
+        if not cleaned:
+            return "User made a general request."
+        return cleaned[:max_chars]
+
+    def _fallback_assistant_memory_summary(self, text: str, max_chars: int = 420) -> str:
+        cleaned = self._strip_thinking_for_storage(text)
+        cleaned = self._plain_text_compact(cleaned)
+        if not cleaned:
+            return "Assistant provided a response."
+
+        identity_match = re.search(
+            r"(?i)\bmy name is\s+([A-Za-z0-9_.-]+).*?(?:i can|i am able to|i help|capabilities|functionality)",
+            cleaned,
+        )
+        if identity_match:
+            name = identity_match.group(1).strip("`'\".,:;!?- ")
+            return (
+                f"Assistant introduced itself as {name} and explained its main capabilities, "
+                "including conversation, writing, reasoning, coding help, analysis, and limitations."
+            )
+
+        sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+        useful_sentences = [
+            sentence.strip()
+            for sentence in sentences
+            if sentence.strip()
+            and not sentence.strip().lower().startswith(("hello", "sure", "of course"))
+        ]
+        selected = " ".join(useful_sentences[:2]).strip() or cleaned
+        return selected[:max_chars]
+
+    def _plain_text_compact(self, text: str) -> str:
+        cleaned = text.strip()
+        cleaned = re.sub(r"```.*?```", " ", cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r"`([^`]*)`", r"\1", cleaned)
+        cleaned = re.sub(r"\*\*\*([^*]*)\*\*\*", r"\1", cleaned)
+        cleaned = re.sub(r"\*\*([^*]*)\*\*", r"\1", cleaned)
+        cleaned = re.sub(r"\*([^*]*)\*", r"\1", cleaned)
+        cleaned = re.sub(r"^#+\s*", "", cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r"[-_]{3,}", " ", cleaned)
+        cleaned = re.sub(r"[🔍✅🛠️🔑📌⚠️🚀]+", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip()
+
+    def _strip_thinking_for_storage(self, text: str) -> str:
+        cleaned = self._strip_mlx_output_headers(text)
+        answer, thinking = self._split_thinking_output(cleaned)
+        if answer:
+            return answer.strip()
+        if thinking:
+            return ""
+        return cleaned.strip()
 
     def _summarise_text(self, text: str, instruction: str, max_tokens: str = "64") -> str:
         model = self._resolve_model(self.active_prompt_model_key)
@@ -1762,56 +2690,30 @@ class SimpleAgentGUI:
 
         summary_prompt = (
             f"{instruction}\n\n"
-            "Return only the requested output.\n\n"
+            "Return only the requested output. "
+            "Do not explain. Do not include reasoning. Do not include <think> tags.\n\n"
             f"Text:\n{text}"
         )
-        command = [
-            self.python_executable,
-            "-m",
-            "mlx_lm",
-            "generate",
-            "--model",
-            str(local_model_path),
-            "--prompt",
-            summary_prompt,
-            "--max-tokens",
-            max_tokens,
-        ]
 
         env = os.environ.copy()
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
 
         try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
+            visible_response = self._generate_text_with_budget(
+                local_model_path=local_model_path,
+                prompt=summary_prompt,
+                max_tokens=self.default_response_tokens,
                 env=env,
+                show_thinking=False,
             )
         except Exception:
             return ""
 
-        if result.returncode != 0:
+        cleaned_value = self._clean_hidden_value(visible_response)
+        if not cleaned_value or self._summary_looks_bad(cleaned_value):
             return ""
-
-        output = result.stdout.strip()
-        if not output:
-            return ""
-
-        hidden_prefixes = (
-            "==========",
-            "Prompt:",
-            "Generation:",
-            "Peak memory:",
-        )
-        cleaned_lines = [
-            line.strip()
-            for line in output.splitlines()
-            if line.strip() and not line.startswith(hidden_prefixes)
-        ]
-        return " ".join(cleaned_lines).strip()[:300]
+        return cleaned_value[:420]
 
     def _download_text_models_async(self) -> None:
         if self.is_generating:
@@ -1826,7 +2728,7 @@ class SimpleAgentGUI:
     def _download_text_models_worker(self) -> None:
         messages: list[str] = []
         for model in MODEL_LIBRARY:
-            if model["runtime"] not in {"mlx-lm", "sentence-transformers"}:
+            if model["runtime"] not in {"mlx-lm", "mlx-vlm", "sentence-transformers"}:
                 messages.append(f"Skipped unsupported download runtime: {model['id']}")
                 continue
             self.root.after(0, lambda model_key=model["key"]: self._set_loading_base(f"Downloading {model_key}"))
@@ -1851,13 +2753,17 @@ class SimpleAgentGUI:
         if metadata_path.exists() and local_model_path.exists():
             return f"Already installed: {model['key']}"
 
-        if model["runtime"] == "sentence-transformers":
+        if model["runtime"] in {"sentence-transformers", "mlx-vlm"}:
             try:
                 from huggingface_hub import snapshot_download
             except Exception:
                 return "Install huggingface-hub to download the RAG model: pip install huggingface-hub"
 
+
             try:
+                if local_model_path.exists():
+                    shutil.rmtree(local_model_path, ignore_errors=True)
+
                 snapshot_download(
                     repo_id=model["id"],
                     local_dir=str(local_model_path),

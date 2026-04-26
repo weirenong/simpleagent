@@ -8,6 +8,7 @@ models/
 
 # === Chats ===
 chats/
+temp_attachments/
 
 # === Python ===
 pycache/

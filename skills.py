@@ -127,12 +127,14 @@ def get_all_skills() -> str:
             "0: no_skill - Do not call any skill. Use this when internet data is unnecessary.",
             "1: internet_search - Search the internet for current or factual information and return ranked snippets as grounding context.",
             "2: scrape_url - Extract relevant information from one or more user-provided URLs and return page excerpts as grounding context.",
-            "3: memory_rag - Retrieve relevant past conversation messages for context when the user refers to previous discussion."
+            "3: memory_rag - Retrieve relevant past conversation messages for context when the user refers to previous discussion.",
+            "4: attachment_vision - Analyse attached images or videos with the local VL model when the user attaches visual files or asks about an attachment.",
+            "5: text_file_reader - Read attached plain-text, markdown, code, config, CSV, JSON, HTML, CSS, SQL, shell, YAML, and other text-like files from local file paths."
         ]
     )
 
 def get_valid_skill_ids() -> set[int]:
-    return {0, 1, 2, 3}
+    return {0, 1, 2, 3, 4, 5}
 
 
 def execute_skill(skill_id: int, user_prompt: str, memory_items: list[dict[str, str]] | None = None) -> str:
@@ -142,6 +144,12 @@ def execute_skill(skill_id: int, user_prompt: str, memory_items: list[dict[str, 
         return scrape_url(user_prompt)
     if skill_id == 3:
         return memory_rag_search(user_prompt, memory_items or [])
+    if skill_id == 4:
+        # Attachment vision is executed inside simple_agent.py because it needs access to local attachment paths and the VL runtime.
+        return ""
+    if skill_id == 5:
+        # Text file reading is executed inside simple_agent.py because it needs access to local attachment paths.
+        return ""
     return ""
 
 
