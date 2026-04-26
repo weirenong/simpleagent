@@ -1,5 +1,9 @@
 # SimpleAgent — Lightweight Local AI Agent
 
+<p align="center">
+  <img src="simpleagent_logo.png" alt="SimpleAgent screenshot" width="300">
+</p>
+
 SimpleAgent is a local-first desktop AI agent built for Apple Silicon.
 
 It runs small local models with MLX and gives them a practical agent system around them: memory, skills, file attachments, web search, vision analysis, text-file reading, and a simple GUI.
