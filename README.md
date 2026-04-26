@@ -8,6 +8,8 @@ The goal is simple:
 
 > Make small local models more useful by giving them structure, tools, and context.
 
+![SimpleAgent screenshot](screenshot.png)
+
 ---
 
 ## What SimpleAgent Can Do
