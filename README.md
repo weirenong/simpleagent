@@ -1,230 +1,196 @@
-# SimpleAgent — (Low-Resource AI Agent Framework)
+# SimpleAgent — Lightweight Local AI Agent
 
-SimpleAgent is a lightweight local-first AI agent built around one core idea:
+SimpleAgent is a local-first desktop AI agent built for Apple Silicon.
 
-> Small models can become much more useful when they are given structure, memory, and carefully controlled tools.
+It runs small local models with MLX and gives them a practical agent system around them: memory, skills, file attachments, web search, vision analysis, text-file reading, and a simple GUI.
 
-This project experiments with running a small local Qwen model on Apple Silicon using MLX, then wrapping it with a simple agent system that can route tasks, call skills, search memory, scrape pages, and generate better responses without relying on a large cloud model.
+The goal is simple:
 
----
-
-## The Problem We Are Solving
-
-Most small local models are good at simple chat, but weak at agent behaviour.
-
-The biggest missing piece is reliable tool calling.
-
-Large cloud models can usually:
-- decide when to use tools
-- output structured JSON
-- browse or retrieve information
-- remember context across turns
-- recover from messy tool outputs
-
-Small models struggle because they often:
-- break JSON formats
-- overuse tools when not needed
-- fail to call tools when needed
-- hallucinate tool results
-- lose context quickly
-- produce weaker answers when information is not directly in the prompt
-
-SimpleAgent is designed to solve this by using a lightweight, controlled system around the model.
-
-Instead of expecting a small model to behave like GPT-4, we give it guardrails.
+> Make small local models more useful by giving them structure, tools, and context.
 
 ---
 
-## Core Design Thinking
+## What SimpleAgent Can Do
 
-### 1. Keep the model small
+SimpleAgent is more than a local chatbot.
 
-The main orchestrator model is intentionally small so it can run locally on consumer Apple Silicon hardware.
+It can:
 
-The goal is not to beat large cloud models directly. The goal is to maximise capability per unit of compute.
+- chat with a local Qwen model
+- use a thinking model for stronger reasoning
+- search the web when needed
+- scrape user-provided URLs
+- remember recent conversation summaries
+- read attached text and code files
+- analyse attached images and videos with a vision model
+- paste images directly from clipboard as attachments
+- drag and drop files into the chat
+- pin attachments so they stay available across prompts
+- display debug logs and raw model outputs in a console window
+- show response time and token allowance after each reply
+- render markdown-style formatting in the GUI
 
-### 2. Use structure instead of model size
+---
 
-Rather than making the model responsible for everything, SimpleAgent separates responsibilities:
+## Why This Exists
 
-| Layer | Responsibility |
-|---|---|
-| GUI | Chat interface and user interaction |
-| Orchestrator model | Reasoning, final responses, skill routing |
-| Skills | External actions such as search, scraping, memory retrieval |
-| Memory | Summarised context from previous turns |
-| Parser | Converts messy model routing output into safe skill calls |
+Small local models are useful, but they often struggle with agent behaviour.
 
-This makes the system easier to debug and more reliable.
+They may:
 
-### 3. Avoid fragile JSON tool calling
+- forget context quickly
+- call tools when they should not
+- fail to call tools when they should
+- break strict JSON formats
+- hallucinate when they lack information
+- struggle with messy tool results
 
-Small models often fail strict JSON output.
+SimpleAgent avoids relying on fragile complex tool calling.
 
-SimpleAgent currently uses integer-based skill routing instead:
+Instead, it uses a controlled skill-routing system, simple IDs, deterministic rules, memory summaries, and clear debugging output.
+
+This makes a small model behave more like a practical assistant without needing a large cloud model.
+
+---
+
+## Main Features
+
+### Local Chat
+
+SimpleAgent runs a local Qwen model through MLX.
+
+The current main model is a Qwen3 thinking model, which gives better reasoning than a normal instruction model.
+
+It is used for:
+
+- normal chat
+- reasoning
+- coding help
+- final response generation
+- skill routing
+- search query generation
+- chat titles
+- memory summaries
+
+Thinking output is handled safely. The app keeps the final answer clean instead of showing the full thinking trace in the chat.
+
+---
+
+### Date and Time Awareness
+
+Every main prompt includes the current local date and time.
+
+This helps the model understand phrases like:
+
+- today
+- tomorrow
+- yesterday
+- this week
+- this month
+- this year
+- latest
+- current
+
+---
+
+### Skill Routing
+
+SimpleAgent uses numbered skills instead of complex JSON tool calls.
+
+| Skill ID | Skill | What it does |
+|---:|---|---|
+| 0 | `no_skill` | Normal answer without tools |
+| 1 | `internet_search` | Search online for current or factual information |
+| 2 | `scrape_url` | Read and extract information from a URL |
+| 3 | `memory_rag` | Search previous memory summaries |
+| 4 | `attachment_vision` | Analyse attached images or videos |
+| 5 | `text_file_reader` | Read attached text, code, markdown, config, CSV, JSON, SQL, HTML, CSS, shell, YAML, and similar files |
+
+The router can select one or more skills before generating the final answer.
+
+Example:
 
 ```text
-0 = no skill
-1 = internet search
-2 = scrape URL
-3 = memory RAG
+User asks for latest news
+↓
+Skill 1 runs internet search
+↓
+Search results are added to the prompt
+↓
+The model answers using the search context
 ```
 
-The model is prompted to return skill IDs, and the parser safely handles imperfect outputs.
-
-Examples:
-
-| Model output | Parsed result |
-|---|---|
-| `1` | internet search |
-| `1,2` | internet search + scrape URL |
-| `use internet_search` | internet search |
-| `no skill needed` | no skill |
-| random invalid numbers | ignored |
-
-### 4. Use deterministic rules where possible
-
-Some tool calls should not be left entirely to model discretion.
-
-Examples:
-- If a prompt contains a URL, use the URL scraping skill.
-- If a prompt clearly asks for latest/current/news/price information, allow internet search.
-- If a prompt references earlier discussion, use memory RAG.
-- If a prompt is a normal follow-up like “what do you think”, avoid internet search.
-
-This reduces unnecessary tool calls and improves answer quality.
-
-### 5. Make the agent observable
-
-SimpleAgent prints debug information to the console so we can inspect:
-- raw model outputs
-- skill router decisions
-- selected skill IDs
-- generated search queries
-- scraped page content
-- skill outputs
-- final responses
-
-The GUI also shows loading stages such as:
-- Preparing context
-- Routing skills
-- Choosing tools
-- Searching internet
-- Scraping URL
-- Searching memory
-- Building prompt
-- Generating answer
-- Saving memory
-
-This makes the agent easier to understand and improve.
-
 ---
 
-## Current Skills
+### Internet Search
 
-SimpleAgent currently supports the following skills.
+The internet search skill is used when the user asks for current, latest, factual, or online information.
 
-| Skill ID | Skill | Purpose |
-|---:|---|---|
-| 0 | `no_skill` | Do not call any skill. Used for normal reasoning, writing, coding help, or conversation. |
-| 1 | `internet_search` | Searches the web, ranks results, extracts snippets/page excerpts, and returns grounding context. |
-| 2 | `scrape_url` | Extracts relevant information from one or more user-provided URLs. |
-| 3 | `memory_rag` | Retrieves relevant past memory summaries using semantic search when the user references earlier conversation. |
+It can be triggered by prompts like:
 
----
+- search online
+- latest news
+- current price
+- look this up
+- what is happening today
+- recent updates
 
-## Skill Details
-
-### Skill 1 — Internet Search
-
-The internet search skill is used when the user explicitly needs current, external, or factual online information.
-
-Flow:
+The search flow is:
 
 ```text
 User prompt
 ↓
-Model generates a concise search query
+Generate search query
 ↓
-Search engine results are fetched
+Search online
 ↓
-Top results are ranked
+Rank results
 ↓
-Top pages are optionally fetched for deeper excerpts
+Extract relevant snippets
 ↓
-Relevant search context is appended to the final prompt
+Add search context to final prompt
 ↓
-Qwen answers using the retrieved context
+Generate answer
 ```
 
-This skill currently uses DuckDuckGo HTML search as a lightweight search source.
-
-Search result ranking uses:
-- MiniLM sentence-transformer embeddings when available
-- keyword overlap fallback when the embedding model is unavailable
-
-### Skill 2 — URL Scraping
-
-The URL scraping skill is used when the user provides a link.
-
-Flow:
-
-```text
-User provides URL
-↓
-URL is extracted from prompt
-↓
-Page is fetched
-↓
-JavaScript rendering is attempted using Playwright when available
-↓
-Fallback to lightweight urllib fetch if needed
-↓
-Page text is cleaned and condensed
-↓
-Relevant excerpt is appended to final prompt
-```
-
-This allows the agent to answer questions about specific webpages.
-
-### Skill 3 — Memory RAG
-
-The memory RAG skill retrieves relevant previous memory summaries.
-
-Flow:
-
-```text
-User references earlier context
-↓
-Memory RAG skill is triggered
-↓
-Stored memory summaries are embedded
-↓
-Relevant memories are semantically ranked
-↓
-Top matching memory items are appended to prompt
-↓
-Qwen answers with past context
-```
-
-This improves follow-up answers like:
-- “What do you think?”
-- “Based on what we discussed earlier…”
-- “Remind me what we decided.”
-- “Why did we choose that approach?”
+Search result ranking can use MiniLM embeddings when available, with a keyword fallback.
 
 ---
 
-## Memory System
+### URL Scraping
 
-SimpleAgent has a lightweight summarised memory system.
+If the user provides a URL, SimpleAgent can scrape it and use the page content as context.
 
-After each assistant response, the model performs two internal summarisation steps:
+The flow is:
 
-1. Summarise the user prompt
-2. Summarise the assistant response
+```text
+User gives URL
+↓
+Extract URL
+↓
+Fetch page
+↓
+Use Playwright when JavaScript rendering is needed
+↓
+Clean page text
+↓
+Add relevant excerpt to prompt
+```
 
-The summaries are stored as memory pairs:
+This is useful for:
+
+- summarising webpages
+- extracting important points
+- reading documentation pages
+- asking questions about a specific link
+
+---
+
+### Memory
+
+SimpleAgent stores lightweight memory after each turn.
+
+After every response, it creates:
 
 ```json
 {
@@ -233,92 +199,216 @@ The summaries are stored as memory pairs:
 }
 ```
 
-The system keeps a rolling window of recent memory items.
+These summaries are used in two ways:
 
-Memory is used in two ways:
-
-| Memory Layer | Behaviour |
+| Memory type | Purpose |
 |---|---|
-| Recent memory injection | Recent summaries are automatically included in prompts. |
-| Memory RAG skill | Relevant memories are retrieved when the user references past discussion. |
+| Recent memory injection | Adds recent summaries to the prompt automatically |
+| Memory RAG | Searches older summaries when the user refers to previous discussion |
 
-This keeps the agent lightweight while still giving it useful continuity.
-
----
-
-## Why This Is Interesting
-
-Offline local LLM apps already exist.
-
-The unusual part of this project is not just offline chat.
-
-The interesting part is:
-
-> Low-resource tool calling for small local models.
-
-SimpleAgent attempts to make small models behave more like agents by combining:
-- structured routing
-- deterministic rules
-- robust parsing
-- memory summaries
-- semantic memory retrieval
-- web search
-- URL scraping
-- visible debugging
-
-This is a low-resource agent architecture rather than just a local chatbot.
+This gives the assistant continuity without storing huge full-history prompts.
 
 ---
 
-## Architecture
+### Attachments
 
-Current high-level flow:
+SimpleAgent supports attachments through:
+
+- drag and drop
+- file picker
+- image paste from clipboard
+
+Attached files appear as chips in the composer.
+
+Each attachment can be:
+
+- removed with `X`
+- pinned for reuse in the next prompt
+
+Pinned attachments stay attached after sending a message. Unpinned attachments are cleared after the message is sent.
+
+---
+
+### Image and Video Attachments
+
+Images and videos are routed to the vision skill.
+
+Supported visual extensions include:
 
 ```text
-User message
+.png, .jpg, .jpeg, .webp, .bmp, .gif,
+.mp4, .mov, .avi, .mkv, .webm
+```
+
+The vision flow is:
+
+```text
+Attach image or video
 ↓
-Save message to local chat file
+Skill 4 selected
 ↓
-Build recent memory context
+Qwen2.5-VL analyses the file
 ↓
-Decide which skills are needed
+Vision summary is added to the main prompt
 ↓
-Run selected skills
+Qwen3 answers using that visual context
+```
+
+This can be used for:
+
+- screenshots
+- UI images
+- charts
+- visual documents
+- candlestick chart screenshots
+- pasted clipboard images
+
+The vision model is run in a separate subprocess, so it is released from memory after analysis finishes.
+
+---
+
+### Text and Code File Attachments
+
+Text-like files are routed to the text file reader skill.
+
+Supported examples include:
+
+```text
+.txt, .md, .markdown, .rst, .log,
+.py, .js, .ts, .html, .css, .sql,
+.json, .yaml, .yml, .toml, .ini,
+.csv, .tsv,
+.sh, .bash, .zsh,
+.java, .cpp, .cs, .go, .rs, .php,
+.env, .gitignore, .dockerignore
+```
+
+The text file flow is:
+
+```text
+Attach text/code file
 ↓
-Append skill outputs to prompt
+Skill 5 selected
 ↓
-Generate final answer with local Qwen model
+File content is read locally
 ↓
-Save assistant response
+Content is added to prompt
 ↓
-Summarise turn into memory
-↓
-Update GUI
+Model answers using the file content
+```
+
+This makes it possible to attach multiple scripts and ask the model to:
+
+- explain code
+- find bugs
+- suggest refactors
+- compare files
+- write new functions
+- propose patch-style edits
+
+---
+
+### Attachment Pinning
+
+Attachments can be pinned.
+
+This is useful when you want to keep asking questions about the same file.
+
+Example:
+
+```text
+Attach simple_agent.py
+Pin it
+Ask: explain this file
+Ask: where should I add PDF support?
+Ask: suggest a cleaner module split
+```
+
+The file stays available until you unpin or remove it.
+
+---
+
+### Temporary Attachments
+
+Pasted clipboard images are saved into:
+
+```text
+temp_attachments/
+```
+
+The app includes a menu option to clear these temporary files.
+
+This helps prevent pasted images from piling up over time.
+
+---
+
+### Console Output Window
+
+SimpleAgent has a GUI console window.
+
+It shows useful debugging information such as:
+
+- raw model output
+- skill router decisions
+- selected skill IDs
+- skill inputs
+- skill outputs
+- model errors
+- response logs
+
+This makes the agent easier to debug without relying only on the PyCharm terminal.
+
+---
+
+### Markdown Formatting
+
+The chat display supports common markdown-style formatting:
+
+- headings
+- bullets
+- numbered lists
+- bold text
+- italic text
+- inline code
+- code blocks
+- blockquotes
+- horizontal dividers
+- basic tables
+- clickable links
+
+This makes model responses easier to read in the GUI.
+
+---
+
+### Response Controls
+
+The GUI includes response token options.
+
+This is useful because thinking models can use many tokens before producing the final answer.
+
+The app also shows response time after each reply, for example:
+
+```text
+Response generated. Tokens used allowance: 32768 • Time: 46.9s
 ```
 
 ---
 
 ## Model Setup
 
-Current primary model:
+Current model roles:
 
 | Role | Model | Runtime |
 |---|---|---|
-| Orchestrator | Qwen2.5-3B-Instruct 4-bit | MLX |
-| Code Specialist | Qwen2.5-Coder-7B-Instruct 4-bit | MLX |
-| Vision Specialist | Qwen2.5-VL-3B-Instruct 4-bit | MLX-VLM |
-| RAG Embedding | all-MiniLM-L6-v2 | sentence-transformers |
+| Main reasoning model | Qwen3-4B-Thinking-2507 MLX 4-bit | `mlx-lm` |
+| Vision model | Qwen2.5-VL-3B-Instruct MLX 4-bit | `mlx-vlm` |
+| Embedding model | all-MiniLM-L6-v2 | `sentence-transformers` |
 
-The orchestrator model handles:
-- final response generation
-- title generation
-- memory summarisation
-- skill routing
-- search query generation
+The main model handles chat and reasoning.
 
-The MiniLM embedding model handles:
-- web result ranking
-- semantic memory retrieval
+The vision model handles image and video attachments.
+
+The embedding model helps with semantic ranking for memory and search results.
 
 ---
 
@@ -326,8 +416,10 @@ The MiniLM embedding model handles:
 
 ### Hardware
 
-- Apple Silicon Mac: M1 / M2 / M3 / M4
-- Recommended: 16GB RAM or more
+Recommended:
+
+- Apple Silicon Mac: M1, M2, M3, or M4
+- 16GB RAM or more
 
 ### Software
 
@@ -335,7 +427,7 @@ The MiniLM embedding model handles:
 - Python 3.10+
 - Git
 
-### Python Packages
+### Python packages
 
 Core:
 
@@ -343,13 +435,25 @@ Core:
 pip install mlx-lm
 ```
 
-Recommended for RAG and model downloads:
+Recommended:
 
 ```bash
 pip install sentence-transformers huggingface-hub
 ```
 
-Recommended for JavaScript-rendered webpage scraping:
+For vision attachments:
+
+```bash
+pip install mlx-vlm pillow torch torchvision
+```
+
+For drag and drop:
+
+```bash
+pip install tkinterdnd2
+```
+
+For webpage scraping with JavaScript rendering:
 
 ```bash
 pip install playwright
@@ -360,14 +464,14 @@ python -m playwright install chromium
 
 ## Setup
 
-### 1. Clone project
+### 1. Clone the project
 
 ```bash
 git clone <your-repo-url>
 cd simpleagent
 ```
 
-### 2. Create virtual environment
+### 2. Create a virtual environment
 
 ```bash
 python -m venv .venv
@@ -378,29 +482,31 @@ source .venv/bin/activate
 
 ```bash
 pip install -U pip
-pip install mlx-lm sentence-transformers huggingface-hub
+pip install mlx-lm mlx-vlm sentence-transformers huggingface-hub pillow tkinterdnd2 torch torchvision
 ```
 
-Optional for JavaScript website scraping:
+Optional for webpage scraping:
 
 ```bash
 pip install playwright
 python -m playwright install chromium
 ```
 
-### 4. Start app
+### 4. Run the app
 
 ```bash
 python simple_agent.py
 ```
 
-Use the menu option:
+### 5. Download models
+
+Use the app menu:
 
 ```text
-Download Models
+File → Download Models
 ```
 
-This downloads local models into:
+Models are saved under:
 
 ```text
 models/<model_key>/model/
@@ -408,119 +514,102 @@ models/<model_key>/model/
 
 ---
 
-## GUI Features
+## Local Folders
 
-SimpleAgent includes a Tkinter-based desktop GUI.
+SimpleAgent stores local data in these folders:
 
-Current GUI features:
-- Local chat interface
-- Individual chat files
-- Auto-generated chat titles
-- Markdown-like formatting
-- Headings, bullets, bold, italic, code formatting
-- Basic table rendering
-- Clickable links
-- Auto-expanding input box
-- Loading/status stages
-- Delete chats
-- Model response token-size dropdown
+| Folder | Purpose |
+|---|---|
+| `chats/` | Saved chat files |
+| `models/` | Downloaded local models |
+| `temp_attachments/` | Pasted clipboard images and temporary attachments |
 
----
-
-## Local Files
-
-Chats are stored locally under:
-
-```text
-chats/
-```
-
-Each chat is saved as an individual text/JSON-like file.
-
-Models are stored locally under:
-
-```text
-models/
-```
-
----
-
-## Local-First Philosophy
-
-SimpleAgent is designed to prioritise:
-
-- local execution
-- low resource usage
-- clear architecture
-- visible debugging
-- hackability
-- modular skills
-- small-model capability
-
-The goal is not to create the largest model.
-
-The goal is to build a system where a small model can do more by using the right structure.
-
----
-
-## Current Limitations
-
-This is still an experimental prototype.
-
-Known limitations:
-- Search scraping can fail if sites block requests.
-- JavaScript scraping requires Playwright.
-- Memory RAG currently searches stored summaries, not a full vector database of all chat messages.
-- Small models may still make weak routing or reasoning decisions.
-- Web extraction is heuristic and may miss important information.
-- Tkinter UI has visual limitations compared with modern web UI frameworks.
-
----
-
-## Future Improvements
-
-High-value future upgrades:
-
-- Full chat-history vector memory
-- FAISS or SQLite vector storage
-- Better webpage extraction
-- Multi-step planner/executor loop
-- Skill chaining
-- Confidence scoring for tool outputs
-- Better table rendering
-- Streaming model output
-- Runtime abstraction for llama.cpp / GGUF on Windows
-- Better packaging for macOS
-
----
-
-## Design Philosophy
-
-> Build intelligence through structure, not size.
-
-SimpleAgent is an experiment in making small models useful by surrounding them with:
-- memory
-- tools
-- routing
-- retrieval
-- debugging
-- deterministic control
-
-Small models alone are limited.
-
-Small models inside a good system can become powerful.
-
----
-
-## Git Ignore Reminder
-
-Ensure this is in `.gitignore`:
+Recommended `.gitignore` entries:
 
 ```text
 models/
 .venv/
 chats/
+temp_attachments/
 ```
+
+---
+
+## How The Agent Works
+
+High-level flow:
+
+```text
+User sends message
+↓
+Save user message
+↓
+Prepare date/time context
+↓
+Prepare recent memory context
+↓
+Route skills
+↓
+Run selected skills
+↓
+Read or analyse attachments
+↓
+Build final prompt
+↓
+Generate answer with local model
+↓
+Save assistant response
+↓
+Summarise turn into memory
+↓
+Update GUI
+```
+
+This structure lets a small model behave more like an agent.
+
+---
+
+## Design Philosophy
+
+SimpleAgent follows a few simple principles:
+
+### 1. Local first
+
+The app is designed to run locally on a Mac.
+
+### 2. Small model, better system
+
+Instead of relying only on a huge model, SimpleAgent gives a small model better context and tools.
+
+### 3. Use deterministic logic where possible
+
+File extensions, URLs, and obvious tool triggers should be handled by code, not guessed by the model.
+
+### 4. Make everything visible
+
+The console window shows what the agent is doing internally.
+
+This makes debugging much easier.
+
+### 5. Keep it hackable
+
+The project is intentionally simple enough to modify and extend.
+
+---
+
+## Current Limitations
+
+SimpleAgent is still experimental.
+
+Known limitations:
+
+- Web search quality depends on available search results.
+- Some websites may block scraping.
+- JavaScript-heavy pages need Playwright.
+- Vision analysis requires the correct MLX-VLM model and dependencies.
+- Text attachments can become very large and slow down responses.
+- The model can suggest code changes, but automatic patch application is not yet part of the core workflow.
+- PDF, DOCX, XLSX, and PPTX files are not deeply parsed yet unless converted or handled through future skills.
 
 ---
 
@@ -530,4 +619,4 @@ chats/
 python simple_agent.py
 ```
 
-Start experimenting.
+Start chatting, attach files, search online, and experiment.
