@@ -125,6 +125,11 @@ class SimpleAgentGUI:
         self.console_text: tk.Text | None = None
         self.console_backlog: list[str] = []
         self.pending_attachments: list[dict[str, str]] = []
+        self.pending_knowledge_files: list[dict[str, Any]] = []
+        self.knowledge_embedding_model: Any | None = None
+        self.knowledge_chunk_cache: dict[str, dict[str, Any]] = {}
+        self.loaded_mlx_models: dict[str, tuple[Any, Any]] = {}
+        self.loaded_mlx_lock = threading.Lock()
         self.image_attachment_extensions = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
         self.video_attachment_extensions = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
         self.vl_supported_extensions = self.image_attachment_extensions | self.video_attachment_extensions
@@ -253,6 +258,10 @@ class SimpleAgentGUI:
         view_menu = tk.Menu(menu_bar, tearoff=0)
         view_menu.add_command(label="Show Console Output", command=self._show_console_window)
         view_menu.add_command(label="Clear Console Output", command=self._clear_console_output)
+        view_menu.add_separator()
+        view_menu.add_command(label="README.md", command=self._show_readme_window)
+        view_menu.add_separator()
+        view_menu.add_command(label="Unload MLX Models From Memory", command=self._unload_loaded_mlx_models)
 
         menu_bar.add_cascade(label="File", menu=file_menu)
         menu_bar.add_cascade(label="View", menu=view_menu)
@@ -307,6 +316,245 @@ class SimpleAgentGUI:
         self.console_text.configure(state="normal")
         self.console_text.delete("1.0", tk.END)
         self.console_text.configure(state="disabled")
+
+    def _show_readme_window(self) -> None:
+        if hasattr(self, "readme_window") and self.readme_window.winfo_exists():
+            self.readme_window.lift()
+            self.readme_window.focus_force()
+            return
+
+        readme_path = Path.cwd() / "README.md"
+        if not readme_path.exists():
+            messagebox.showerror("README Not Found", f"Could not find README.md at:\n\n{readme_path}")
+            return
+
+        try:
+            readme_content = readme_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            messagebox.showerror("README Read Failed", f"Could not read README.md.\n\n{exc}")
+            return
+
+        root_bg = self.root.cget("bg") or "#202123"
+        self.readme_window = tk.Toplevel(self.root)
+        self.readme_window.title("README.md")
+        self.readme_window.geometry("920x720")
+        self.readme_window.configure(bg=root_bg)
+
+        container = ttk.Frame(self.readme_window, padding=12, style="Main.TFrame")
+        container.pack(fill="both", expand=True)
+
+        header = ttk.Frame(container, style="Main.TFrame")
+        header.pack(fill="x", pady=(0, 8))
+
+        title = ttk.Label(header, text="README.md", style="Heading.TLabel")
+        title.pack(side="left")
+
+        path_label = ttk.Label(header, text=str(readme_path), style="Meta.TLabel")
+        path_label.pack(side="right")
+
+        body_frame = ttk.Frame(container, style="Main.TFrame")
+        body_frame.pack(fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(body_frame, orient="vertical")
+        scrollbar.pack(side="right", fill="y")
+
+        self.readme_text = tk.Text(
+            body_frame,
+            wrap="word",
+            bg=root_bg,
+            fg="#e7eee8",
+            insertbackground="#e7eee8",
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=18,
+            font=("Aptos", 13),
+            yscrollcommand=scrollbar.set,
+        )
+        self.readme_text.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=self.readme_text.yview)
+
+        self._configure_readme_tags(self.readme_text)
+        self._render_markdown_to_text_widget(self.readme_text, readme_content)
+        self.readme_text.configure(state="disabled")
+
+    def _configure_readme_tags(self, widget: tk.Text) -> None:
+        widget.tag_configure("h1", font=("Aptos", 24, "bold"), foreground="#d8f0dc", spacing1=16, spacing3=10)
+        widget.tag_configure("h2", font=("Aptos", 20, "bold"), foreground="#d8f0dc", spacing1=14, spacing3=8)
+        widget.tag_configure("h3", font=("Aptos", 17, "bold"), foreground="#d8f0dc", spacing1=12, spacing3=6)
+        widget.tag_configure("h4", font=("Aptos", 15, "bold"), foreground="#d8f0dc", spacing1=10, spacing3=4)
+        widget.tag_configure("body", font=("Aptos", 13), foreground="#e7eee8", spacing3=4)
+        widget.tag_configure("bullet", font=("Aptos", 13), foreground="#e7eee8", lmargin1=24, lmargin2=42, spacing3=3)
+        widget.tag_configure("numbered", font=("Aptos", 13), foreground="#e7eee8", lmargin1=24, lmargin2=48, spacing3=3)
+        widget.tag_configure("quote", font=("Aptos", 13, "italic"), foreground="#b9c7bb", lmargin1=26, lmargin2=26,
+                             spacing1=4, spacing3=4)
+        widget.tag_configure("code", font=("Menlo", 12), foreground="#d8f0dc", background="#111612", lmargin1=18,
+                             lmargin2=18, spacing1=6, spacing3=6)
+        widget.tag_configure("inline_code", font=("Menlo", 12), foreground="#d8f0dc", background="#111612")
+        widget.tag_configure("bold", font=("Aptos", 13, "bold"), foreground="#e7eee8")
+        widget.tag_configure("italic", font=("Aptos", 13, "italic"), foreground="#e7eee8")
+        widget.tag_configure("bold_italic", font=("Aptos", 13, "bold italic"), foreground="#e7eee8")
+        widget.tag_configure("rule", foreground="#526456", spacing1=8, spacing3=8)
+        widget.tag_configure("table", font=("Menlo", 12), foreground="#d8f0dc", background="#111612", spacing1=4,
+                             spacing3=4)
+        widget.tag_configure("link", foreground="#8fd19e", underline=True)
+
+    def _render_markdown_to_text_widget(self, widget: tk.Text, markdown_text: str) -> None:
+        widget.configure(state="normal")
+        widget.delete("1.0", tk.END)
+
+        lines = markdown_text.splitlines()
+        index = 0
+        in_code_block = False
+        code_lines: list[str] = []
+
+        while index < len(lines):
+            line = lines[index].rstrip("\n")
+            stripped = line.strip()
+
+            if stripped.startswith("```"):
+                if in_code_block:
+                    widget.insert(tk.END, "\n".join(code_lines).rstrip() + "\n", "code")
+                    code_lines = []
+                    in_code_block = False
+                else:
+                    in_code_block = True
+                    code_lines = []
+                index += 1
+                continue
+
+            if in_code_block:
+                code_lines.append(line)
+                index += 1
+                continue
+
+            table_result = self._collect_markdown_table(lines, index)
+            if table_result is not None:
+                table_rows, next_index = table_result
+                table_text = self._format_markdown_table_for_text_widget(table_rows)
+                widget.insert(tk.END, table_text + "\n", "table")
+                index = next_index
+                continue
+
+            if not stripped:
+                widget.insert(tk.END, "\n", "body")
+                index += 1
+                continue
+
+            if self._is_markdown_horizontal_rule(stripped):
+                widget.insert(tk.END, "─" * 80 + "\n", "rule")
+                index += 1
+                continue
+
+            if stripped.startswith("#### "):
+                widget.insert(tk.END, self._normalize_inline_markdown(stripped[5:].strip()) + "\n", "h4")
+                index += 1
+                continue
+            if stripped.startswith("### "):
+                widget.insert(tk.END, self._normalize_inline_markdown(stripped[4:].strip()) + "\n", "h3")
+                index += 1
+                continue
+            if stripped.startswith("## "):
+                widget.insert(tk.END, self._normalize_inline_markdown(stripped[3:].strip()) + "\n", "h2")
+                index += 1
+                continue
+            if stripped.startswith("# "):
+                widget.insert(tk.END, self._normalize_inline_markdown(stripped[2:].strip()) + "\n", "h1")
+                index += 1
+                continue
+
+            if re.match(r"^[-*•]\s+", stripped):
+                bullet_text = re.sub(r"^[-*•]\s+", "• ", stripped)
+                self._insert_inline_markdown_to_widget(widget, bullet_text, "bullet")
+                widget.insert(tk.END, "\n", "bullet")
+                index += 1
+                continue
+
+            if re.match(r"^\d+\.\s+", stripped):
+                self._insert_inline_markdown_to_widget(widget, stripped, "numbered")
+                widget.insert(tk.END, "\n", "numbered")
+                index += 1
+                continue
+
+            if stripped.startswith(">"):
+                self._insert_inline_markdown_to_widget(widget, stripped[1:].strip(), "quote")
+                widget.insert(tk.END, "\n", "quote")
+                index += 1
+                continue
+
+            self._insert_inline_markdown_to_widget(widget, line.strip(), "body")
+            widget.insert(tk.END, "\n", "body")
+            index += 1
+
+        if in_code_block and code_lines:
+            widget.insert(tk.END, "\n".join(code_lines).rstrip() + "\n", "code")
+
+    def _insert_inline_markdown_to_widget(self, widget: tk.Text, text: str, base_tag: str) -> None:
+        pattern = r"($begin:math:display$\[\^$end:math:display$]+\]$begin:math:text$https\?\:\/\/\[\^\\s\)\]\+$end:math:text$|https?://[^\s)]+|\*\*\*[^*]+\*\*\*|\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)"
+        last_index = 0
+
+        for match in re.finditer(pattern, text):
+            start, end = match.span()
+            if start > last_index:
+                widget.insert(tk.END, text[last_index:start], base_tag)
+
+            token = match.group(0)
+            markdown_link_match = re.match(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", token)
+
+            if markdown_link_match:
+                widget.insert(tk.END, markdown_link_match.group(1).strip(), (base_tag, "link"))
+            elif re.match(r"https?://", token):
+                widget.insert(tk.END, token.rstrip(".,;:!?"), (base_tag, "link"))
+            elif token.startswith("`") and token.endswith("`"):
+                widget.insert(tk.END, token[1:-1], (base_tag, "inline_code"))
+            elif token.startswith("***") and token.endswith("***"):
+                widget.insert(tk.END, token[3:-3], (base_tag, "bold_italic"))
+            elif token.startswith("**") and token.endswith("**"):
+                widget.insert(tk.END, token[2:-2], (base_tag, "bold"))
+            elif token.startswith("*") and token.endswith("*"):
+                widget.insert(tk.END, token[1:-1], (base_tag, "italic"))
+            else:
+                widget.insert(tk.END, token, base_tag)
+
+            last_index = end
+
+        if last_index < len(text):
+            widget.insert(tk.END, text[last_index:], base_tag)
+
+    def _format_markdown_table_for_text_widget(self, rows: list[list[str]]) -> str:
+        if not rows:
+            return ""
+
+        column_count = max(len(row) for row in rows)
+        normalized_rows = [row + [""] * (column_count - len(row)) for row in rows]
+        widths = [
+            max(len(row[column_index]) for row in normalized_rows)
+            for column_index in range(column_count)
+        ]
+
+        formatted_lines: list[str] = []
+        for row_index, row in enumerate(normalized_rows):
+            formatted = " | ".join(
+                row[column_index].ljust(widths[column_index])
+                for column_index in range(column_count)
+            )
+            formatted_lines.append(formatted)
+
+            if row_index == 0:
+                formatted_lines.append("-+-".join("-" * width for width in widths))
+
+        return "\n".join(formatted_lines)
+
+    def _unload_loaded_mlx_models(self) -> None:
+        with self.loaded_mlx_lock:
+            unloaded_count = len(self.loaded_mlx_models)
+            self.loaded_mlx_models.clear()
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+        self._set_status(f"Unloaded {unloaded_count} MLX model(s) from memory.")
 
     def _clear_temp_attachments(self) -> None:
         if self.is_generating:
@@ -482,6 +730,14 @@ class SimpleAgentGUI:
         )
         self.token_selector.grid(row=1, column=0, sticky="e", pady=(4, 0))
         self.token_selector.bind("<<ComboboxSelected>>", self._on_token_selection_changed)
+
+        self.knowledge_button = ttk.Button(
+            self.token_selector_frame,
+            text="Knowledge",
+            command=self._show_knowledge_window,
+            width=8,
+        )
+        self.knowledge_button.grid(row=1, column=1, sticky="e", padx=(8, 0), pady=(4, 0))
 
         self.transcript = tk.Text(
             self.main,
@@ -858,32 +1114,60 @@ class SimpleAgentGUI:
             remove_button.grid(row=0, column=2, sticky="w", padx=(4, 0))
 
     def _handle_input_paste(self, event: tk.Event | None = None) -> str | None:
+        # Fast path: normal text paste should never touch PIL/ImageGrab because
+        # ImageGrab.grabclipboard() can block on macOS for some clipboard states.
+        try:
+            clipboard_text = self.root.clipboard_get()
+            if clipboard_text:
+                return None
+        except tk.TclError:
+            pass
+        except Exception:
+            pass
+
         if ImageGrab is None or Image is None:
             return None
 
+        self._set_status("Checking clipboard image...")
+        threading.Thread(
+            target=self._process_clipboard_image_paste,
+            daemon=True,
+        ).start()
+        return "break"
+
+    def _process_clipboard_image_paste(self) -> None:
         try:
             clipboard_content = ImageGrab.grabclipboard()
-        except Exception:
-            return None
+        except Exception as exc:
+            self.root.after(0, partial(self._set_status, f"Clipboard image paste failed: {exc}"))
+            return
 
         if clipboard_content is None:
-            return None
+            self.root.after(0, partial(self._set_status, "Clipboard does not contain an image."))
+            return
 
         if isinstance(clipboard_content, Image.Image):
-            saved_path = self._save_clipboard_image(clipboard_content)
-            self._add_attachment(str(saved_path))
-            return "break"
+            try:
+                saved_path = self._save_clipboard_image(clipboard_content)
+            except Exception as exc:
+                self.root.after(0, partial(self._set_status, f"Clipboard image save failed: {exc}"))
+                return
+            self.root.after(0, partial(self._add_attachment, str(saved_path)))
+            return
 
         if isinstance(clipboard_content, list):
-            handled_any = False
+            file_paths: list[str] = []
             for item in clipboard_content:
                 item_path = Path(str(item))
                 if item_path.exists() and item_path.is_file():
-                    self._add_attachment(str(item_path))
-                    handled_any = True
-            return "break" if handled_any else None
+                    file_paths.append(str(item_path))
 
-        return None
+            if file_paths:
+                for file_path in file_paths:
+                    self.root.after(0, partial(self._add_attachment, file_path))
+                return
+
+        self.root.after(0, partial(self._set_status, "Clipboard content is not a supported image or file."))
 
     def _save_clipboard_image(self, image: Any) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1013,6 +1297,7 @@ class SimpleAgentGUI:
             data.setdefault("updated_at", data["created_at"])
             data.setdefault("messages", [])
             data.setdefault("memory", [])
+            data.setdefault("knowledge_files", [])
             data["file_path"] = str(path)
             self.state.chats.append(data)
 
@@ -1027,6 +1312,7 @@ class SimpleAgentGUI:
             return
         chat = self._build_new_chat_payload()
         self._save_chat(chat)
+        self._set_status(f"Knowledge files saved: {len(chat.get('knowledge_files', []))}")
         self.state.chats.append(chat)
         self.state.current_chat_id = chat["id"]
 
@@ -1040,6 +1326,7 @@ class SimpleAgentGUI:
             "updated_at": now,
             "messages": [],
             "memory": [],
+            "knowledge_files": [],
         }
 
     def _slugify_title(self, title: str) -> str:
@@ -1108,6 +1395,11 @@ class SimpleAgentGUI:
         if chat is None:
             return
 
+        self._update_chat_header(chat)
+        self._render_transcript(chat)
+        self._load_knowledge_files_from_chat()
+
+    def _update_chat_header(self, chat: dict[str, Any]) -> None:
         self.chat_title_label.config(text=chat.get("title", "New Chat"))
         memory_count = len(chat.get("memory", []))
         message_count = len(chat.get("messages", []))
@@ -1119,7 +1411,19 @@ class SimpleAgentGUI:
                 f"Tokens: {self._response_token_label()}"
             )
         )
-        self._render_transcript(chat)
+
+    def _append_message_to_transcript(self, message: dict[str, Any], clear_placeholder: bool = False) -> None:
+        if clear_placeholder:
+            self.transcript.delete("1.0", tk.END)
+
+        role = message.get("role", "assistant")
+        name = "You" if role == "user" else "SimpleAgent"
+        tag = "user_name" if role == "user" else "assistant_name"
+        self.transcript.insert(tk.END, f"{name}\n", tag)
+        self._insert_formatted_message(str(message.get("content", "")).strip())
+        self._insert_message_attachments(message.get("attachments", []))
+        self.transcript.insert(tk.END, "\n", "separator")
+        self.transcript.see(tk.END)
 
     def _response_token_label(self) -> str:
         if self.selected_response_tokens == self.unlimited_response_tokens:
@@ -1550,6 +1854,213 @@ class SimpleAgentGUI:
                 return chat
         return None
 
+    def _load_knowledge_files_from_chat(self) -> None:
+        chat = self._get_current_chat()
+        if chat is None:
+            self.pending_knowledge_files = []
+            return
+
+        knowledge_files = chat.get("knowledge_files", [])
+        if not isinstance(knowledge_files, list):
+            knowledge_files = []
+
+        normalized_files: list[dict[str, Any]] = []
+        for item in knowledge_files:
+            if isinstance(item, str):
+                path = item
+                name = Path(path).name
+            elif isinstance(item, dict):
+                path = str(item.get("path", ""))
+                name = str(item.get("name", Path(path).name if path else "file"))
+            else:
+                continue
+
+            if not path:
+                continue
+
+            normalized_files.append(
+                {
+                    "path": path,
+                    "name": name,
+                    "missing": not Path(path).exists(),
+                }
+            )
+
+        self.pending_knowledge_files = normalized_files
+        chat["knowledge_files"] = [
+            {"path": item["path"], "name": item["name"]}
+            for item in normalized_files
+        ]
+
+    def _save_knowledge_files_to_chat(self) -> None:
+        chat = self._get_current_chat()
+        if chat is None:
+            return
+
+        chat["knowledge_files"] = [
+            {"path": item.get("path", ""), "name": item.get("name", "file")}
+            for item in self.pending_knowledge_files
+            if item.get("path")
+        ]
+        self._save_chat(chat)
+
+    def _show_knowledge_window(self) -> None:
+        if hasattr(self, "knowledge_window") and self.knowledge_window.winfo_exists():
+            self.knowledge_window.lift()
+            self.knowledge_window.focus_force()
+            self._render_knowledge_file_list()
+            return
+
+        self.knowledge_window = tk.Toplevel(self.root)
+        self.knowledge_window.title("Knowledge Retrieval")
+        self.knowledge_window.geometry("620x420")
+        root_bg = self.root.cget("bg") or "#202123"
+        self.knowledge_window.configure(bg=root_bg)
+
+        container = ttk.Frame(self.knowledge_window, padding=12, style="Main.TFrame")
+        container.pack(fill="both", expand=True)
+
+        title = ttk.Label(
+            container,
+            text="Persistent knowledge files for this chat",
+            style="Heading.TLabel",
+        )
+        title.pack(anchor="w")
+
+        description = ttk.Label(
+            container,
+            text="Drag and drop files here. Paths are saved with this chat. Missing files are shown in red.",
+            style="Meta.TLabel",
+            wraplength=560,
+        )
+        description.pack(anchor="w", pady=(4, 10))
+
+        self.knowledge_drop_frame = ttk.Frame(container, padding=12, style="Main.TFrame")
+        self.knowledge_drop_frame.pack(fill="both", expand=True)
+
+        self.knowledge_list_frame = ttk.Frame(self.knowledge_drop_frame, style="Main.TFrame")
+        self.knowledge_list_frame.pack(fill="both", expand=True)
+
+        footer = ttk.Frame(container, style="Main.TFrame")
+        footer.pack(fill="x", pady=(10, 0))
+
+        add_button = ttk.Button(
+            footer,
+            text="Add Files",
+            command=self._choose_knowledge_files,
+        )
+        add_button.pack(side="left")
+
+        close_button = ttk.Button(
+            footer,
+            text="Close",
+            command=self.knowledge_window.destroy,
+        )
+        close_button.pack(side="right")
+
+        self._enable_knowledge_drop_target(self.knowledge_window)
+        self._enable_knowledge_drop_target(self.knowledge_drop_frame)
+        self._enable_knowledge_drop_target(self.knowledge_list_frame)
+        self._render_knowledge_file_list()
+
+    def _enable_knowledge_drop_target(self, widget: tk.Widget) -> None:
+        if not DND_FILES:
+            return
+
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self._handle_knowledge_drop)
+        except Exception:
+            pass
+
+    def _handle_knowledge_drop(self, event: tk.Event) -> str:
+        paths = self._parse_drop_paths(event.data)
+        for path_value in paths:
+            self._add_knowledge_file(path_value)
+
+        self._save_knowledge_files_to_chat()
+        self._render_knowledge_file_list()
+        return "break"
+
+    def _choose_knowledge_files(self) -> None:
+        paths = filedialog.askopenfilenames(title="Add knowledge files")
+        if not paths:
+            return
+
+        for path_value in paths:
+            self._add_knowledge_file(path_value)
+
+        self._save_knowledge_files_to_chat()
+        self._render_knowledge_file_list()
+
+    def _add_knowledge_file(self, file_path: str) -> None:
+        path = Path(file_path).expanduser()
+        path_string = str(path)
+
+        if any(item.get("path") == path_string for item in self.pending_knowledge_files):
+            return
+
+        self.pending_knowledge_files.append(
+            {
+                "path": path_string,
+                "name": path.name or path_string,
+                "missing": not path.exists(),
+            }
+        )
+        self._set_status(f"Added knowledge file: {path.name or path_string}")
+
+    def _remove_knowledge_file_at(self, index: int) -> None:
+        if 0 <= index < len(self.pending_knowledge_files):
+            removed = self.pending_knowledge_files.pop(index)
+            self._save_knowledge_files_to_chat()
+            self._render_knowledge_file_list()
+            self._set_status(f"Removed knowledge file: {removed.get('name', 'file')}")
+
+    def _render_knowledge_file_list(self) -> None:
+        if not hasattr(self, "knowledge_list_frame"):
+            return
+
+        for child in self.knowledge_list_frame.winfo_children():
+            child.destroy()
+
+        if not self.pending_knowledge_files:
+            empty = ttk.Label(
+                self.knowledge_list_frame,
+                text="No knowledge files added yet. Drag files here or use Add Files.",
+                style="Meta.TLabel",
+            )
+            empty.pack(anchor="w", pady=8)
+            return
+
+        for index, item in enumerate(self.pending_knowledge_files):
+            path = item.get("path", "")
+            name = item.get("name", Path(path).name if path else "file")
+            missing = not Path(path).exists()
+            item["missing"] = missing
+
+            row = ttk.Frame(self.knowledge_list_frame, padding=(0, 4), style="Main.TFrame")
+            row.pack(fill="x", anchor="w")
+
+            root_bg = self.root.cget("bg") or "#202123"
+            label = tk.Label(
+                row,
+                text=f"{name} — {path}" + ("  [missing]" if missing else ""),
+                anchor="w",
+                justify="left",
+                bg=root_bg,
+                fg="#ff6b6b" if missing else "#e7eee8",
+                wraplength=500,
+            )
+            label.pack(side="left", fill="x", expand=True)
+
+            remove_button = ttk.Button(
+                row,
+                text="X",
+                width=3,
+                command=partial(self._remove_knowledge_file_at, index),
+            )
+            remove_button.pack(side="right", padx=(8, 0))
+
     def _send_message(self) -> None:
         if self.is_generating:
             return
@@ -1562,24 +2073,30 @@ class SimpleAgentGUI:
         if not prompt:
             return
 
+        had_existing_messages = bool(chat.get("messages", []))
+
         self.input_box.delete("1.0", tk.END)
         self._auto_resize_input_box()
         attachments_snapshot = [dict(item) for item in self.pending_attachments]
-        chat.setdefault("messages", []).append(
-            {
-                "role": "user",
-                "content": prompt,
-                "attachments": attachments_snapshot,
-            }
-        )
+        user_message = {
+            "role": "user",
+            "content": prompt,
+            "attachments": attachments_snapshot,
+        }
+        chat.setdefault("messages", []).append(user_message)
         self.pending_attachments = [
             attachment for attachment in self.pending_attachments
             if bool(attachment.get("pinned", False))
         ]
         self._render_attachment_bar()
+        self._load_knowledge_files_from_chat()
         self._save_chat(chat)
         self._refresh_chat_list()
-        self._open_current_chat()
+        if self.state.current_chat_id == chat["id"]:
+            self._update_chat_header(chat)
+            self._append_message_to_transcript(user_message, clear_placeholder=not had_existing_messages)
+        else:
+            self._open_current_chat()
 
         self.is_generating = True
         self.generation_started_at = time.perf_counter()
@@ -1643,28 +2160,36 @@ class SimpleAgentGUI:
             return
 
         if error:
-            chat.setdefault("messages", []).append(
-                {"role": "assistant", "content": f"Error: {error}"}
-            )
+            error_message = {"role": "assistant", "content": f"Error: {error}"}
+            chat.setdefault("messages", []).append(error_message)
             self._save_chat(chat)
             self._refresh_chat_list()
-            self._open_current_chat()
+            if self.state.current_chat_id == chat_id:
+                self._update_chat_header(chat)
+                self._append_message_to_transcript(error_message)
             self._set_status(
                 f"Generation failed. Last token budget: {self._format_token_budget(self.last_response_token_budget)} • "
                 f"Time: {self._format_response_time(self.last_response_seconds)}"
             )
             return
 
-        chat.setdefault("messages", []).append({"role": "assistant", "content": response})
+        assistant_message = {"role": "assistant", "content": response}
+        chat.setdefault("messages", []).append(assistant_message)
         self._remember_turn(chat, prompt, response)
 
+        title_changed = False
         if self._should_generate_title(chat) and title:
             chat["title"] = title
+            title_changed = True
 
         self._save_chat(chat)
         self._refresh_chat_list()
         if self.state.current_chat_id == chat_id:
-            self._open_current_chat()
+            if title_changed:
+                self._open_current_chat()
+            else:
+                self._update_chat_header(chat)
+                self._append_message_to_transcript(assistant_message)
         self._set_status(
             f"Response generated. Tokens used allowance: {self._format_token_budget(self.last_response_token_budget)} • "
             f"Time: {self._format_response_time(self.last_response_seconds)}"
@@ -1764,6 +2289,28 @@ class SimpleAgentGUI:
             "Context output to observe:\n"
             f"{observation_source_text}\n"
         )
+        env = os.environ.copy()
+        env["HF_HUB_OFFLINE"] = "1"
+        env["TRANSFORMERS_OFFLINE"] = "1"
+
+        try:
+            self.root.after(0, lambda: self._set_loading_base("Observing skill results"))
+            observation = self._generate_text_with_budget(
+                local_model_path=local_model_path,
+                prompt=observation_prompt,
+                max_tokens=4096,
+                env=env,
+                show_thinking=False,
+            )
+        except Exception:
+            return ""
+
+        observation = observation.strip()
+        if not observation:
+            return ""
+
+        return "Agent observations from tool results:\n" + observation
+
     def _build_code_conversation_context(self, current_prompt: str, max_messages: int = 8) -> str:
         current_chat = self._get_current_chat()
         if current_chat is None:
@@ -1833,27 +2380,6 @@ class SimpleAgentGUI:
             return cleaned
         return cleaned[:max_chars].rstrip() + "..."
 
-        env = os.environ.copy()
-        env["HF_HUB_OFFLINE"] = "1"
-        env["TRANSFORMERS_OFFLINE"] = "1"
-
-        try:
-            self.root.after(0, lambda: self._set_loading_base("Observing skill results"))
-            observation = self._generate_text_with_budget(
-                local_model_path=local_model_path,
-                prompt=observation_prompt,
-                max_tokens=4096,
-                env=env,
-                show_thinking=False,
-            )
-        except Exception:
-            return ""
-
-        observation = observation.strip()
-        if not observation:
-            return ""
-
-        return "Agent observations from tool results:\n" + observation
 
     def _attachment_context_should_be_observed(self, attachment_context: str) -> bool:
         if not attachment_context:
@@ -1882,7 +2408,7 @@ class SimpleAgentGUI:
         return (
             "SimpleAgent context:\n"
             "- You are SimpleAgent, a local-first AI agent running on the user's Mac. The base model may be Qwen, but speak as SimpleAgent unless asked about the model.\n"
-            "- Available context may include memory, skill results, web/search output, URLs, attachments, PDF text, vision analysis, code files, and recent code conversation history. Treat provided context as grounding.\n"
+            "- Available context may include memory, persistent knowledge files, skill results, web/search output, URLs, attachments, PDF text, vision analysis, code files, and recent code conversation history. Treat provided context as grounding.\n"
             "- Answer the user's actual request directly. Do not merely summarise tool output. Do not expose internal planning or agent-loop steps unless asked.\n"
             "- Be factual: do not invent details beyond provided context; if context is missing, failed, weak, truncated, or uncertain, say so clearly.\n"
             "- Prefer practical output: tables for comparisons/multiple items, concise bullets for actions, and patch-style snippets for code changes.\n"
@@ -1896,7 +2422,7 @@ class SimpleAgentGUI:
             "Current date/time context:\n"
             f"- Local date and time: {now.strftime('%A, %d %B %Y, %H:%M:%S %Z')}\n"
             f"- ISO timestamp: {now.isoformat(timespec='seconds')}\n"
-            "Use this as today's date/time when interpreting relative dates like today, tomorrow, yesterday, this week, this month, or this year."
+            "Strictly use this as today's date/time when interpreting relative dates like today, tomorrow, yesterday, this week, this month, or this year."
         )
 
     def _build_attachment_context(self, prompt: str, attachments: list[dict[str, str]]) -> str:
@@ -2151,6 +2677,9 @@ class SimpleAgentGUI:
         self.root.after(0, lambda: self._set_loading_base("Preparing context"))
         memory_block = self._build_memory_block(memory_items)
 
+        self.root.after(0, lambda: self._set_loading_base("Retrieving knowledge"))
+        knowledge_context = self._build_knowledge_retrieval_context(prompt)
+
         self.root.after(0, lambda: self._set_loading_base("Routing skills"))
         skill_ids = self._decide_skill_ids(prompt, memory_items, attachments or [])
 
@@ -2162,7 +2691,14 @@ class SimpleAgentGUI:
 
         self.root.after(0, lambda: self._set_loading_base("Planning response"))
         agent_loop_plan = self._build_agent_loop_plan(prompt, skill_ids, attachments or [])
-        observation_context = self._build_agent_observation_summary(prompt, skill_context, attachment_context)
+        observation_attachment_context = "\n\n".join(
+            part for part in [knowledge_context, attachment_context] if part
+        )
+        observation_context = self._build_agent_observation_summary(
+            prompt,
+            skill_context,
+            observation_attachment_context,
+        )
 
         self.root.after(0, lambda: self._set_loading_base("Building prompt"))
         prompt_parts: list[str] = [
@@ -2171,6 +2707,14 @@ class SimpleAgentGUI:
         ]
         if memory_block:
             prompt_parts.append(memory_block)
+
+        if knowledge_context:
+            prompt_parts.append(knowledge_context)
+            prompt_parts.append(
+                "Knowledge retrieval rules:\n"
+                "- Use persistent knowledge files only when relevant to the current prompt.\n"
+                "- Knowledge files are background context, not normal chat attachments.\n"
+            )
 
         if 7 in skill_ids:
             code_conversation_context = self._build_code_conversation_context(prompt)
@@ -2924,6 +3468,281 @@ class SimpleAgentGUI:
             return value
         return max(self.min_response_tokens, min(self.max_response_tokens, value))
 
+    def _read_knowledge_file_for_retrieval(self, file_path: str, fallback_chars_per_file: int | None = None) -> str:
+        path = Path(file_path)
+        extension = self._attachment_extension(path)
+
+        if extension in self.pdf_attachment_extensions:
+            content = self._read_pdf_attachment(file_path, max_chars=fallback_chars_per_file)
+        elif extension in self.image_attachment_extensions or extension in self.video_attachment_extensions:
+            content = (
+                f"Visual knowledge file is available at {file_path}, "
+                "but visual knowledge retrieval is not automatically analysed yet."
+            )
+        else:
+            content = self._read_text_attachment(file_path, max_chars=fallback_chars_per_file)
+
+        return content.strip() if content else ""
+
+    def _get_knowledge_chunks_for_file(
+            self,
+            file_path: Path,
+            file_name: str,
+            content: str,
+            chunk_chars: int,
+            chunk_overlap: int,
+    ) -> list[dict[str, Any]]:
+        fingerprint = self._knowledge_file_fingerprint(file_path)
+        cache_key = f"{fingerprint}:{chunk_chars}:{chunk_overlap}"
+        cached = self.knowledge_chunk_cache.get(cache_key)
+        if cached:
+            return [dict(chunk) for chunk in cached.get("chunks", [])]
+
+        raw_chunks = self._chunk_knowledge_text(
+            content,
+            chunk_chars=chunk_chars,
+            chunk_overlap=chunk_overlap,
+        )
+
+        chunks: list[dict[str, Any]] = []
+        for index, chunk_text in enumerate(raw_chunks, start=1):
+            chunks.append(
+                {
+                    "path": str(file_path),
+                    "file_name": file_name,
+                    "chunk_number": index,
+                    "text": chunk_text,
+                }
+            )
+
+        self.knowledge_chunk_cache[cache_key] = {"chunks": [dict(chunk) for chunk in chunks]}
+        return chunks
+
+    def _knowledge_file_fingerprint(self, file_path: Path) -> str:
+        try:
+            stat = file_path.stat()
+            return f"{file_path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}"
+        except Exception:
+            return str(file_path)
+
+    def _chunk_knowledge_text(
+            self,
+            text: str,
+            chunk_chars: int = 1800,
+            chunk_overlap: int = 250,
+    ) -> list[str]:
+        cleaned = re.sub(r"\n{3,}", "\n\n", text).strip()
+        if not cleaned:
+            return []
+        if len(cleaned) <= chunk_chars:
+            return [cleaned]
+
+        chunks: list[str] = []
+        start = 0
+        text_length = len(cleaned)
+
+        while start < text_length:
+            end = min(start + chunk_chars, text_length)
+            candidate = cleaned[start:end]
+
+            if end < text_length:
+                paragraph_break = candidate.rfind("\n\n")
+                sentence_break = max(
+                    candidate.rfind(". "),
+                    candidate.rfind("。"),
+                    candidate.rfind("! "),
+                    candidate.rfind("? "),
+                )
+                split_at = paragraph_break if paragraph_break > chunk_chars * 0.55 else sentence_break
+                if split_at > chunk_chars * 0.45:
+                    end = start + split_at + 1
+                    candidate = cleaned[start:end]
+
+            candidate = candidate.strip()
+            if candidate:
+                chunks.append(candidate)
+
+            if end >= text_length:
+                break
+
+            start = max(0, end - chunk_overlap)
+
+        return chunks
+
+    def _load_knowledge_embedding_model(self) -> Any | None:
+        if self.knowledge_embedding_model is not None:
+            return self.knowledge_embedding_model
+
+        embedding_model = self._resolve_model("rag-all-minilm-l6-v2")
+        if embedding_model is None:
+            return None
+
+        model_dir = self.models_dir / embedding_model["key"]
+        local_model_path = model_dir / "model"
+        model_reference = str(local_model_path) if local_model_path.exists() else embedding_model["id"]
+
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            self.knowledge_embedding_model = SentenceTransformer(model_reference)
+            return self.knowledge_embedding_model
+        except Exception as exc:
+            self._log("WARN", f"Knowledge embedding model unavailable, using preview fallback: {exc}")
+            return None
+
+    def _retrieve_relevant_knowledge_chunks(
+            self,
+            prompt: str,
+            chunks: list[dict[str, Any]],
+            max_chunks: int = 8,
+    ) -> list[dict[str, Any]]:
+        if not chunks:
+            return []
+
+        embedding_model = self._load_knowledge_embedding_model()
+        if embedding_model is None:
+            return []
+
+        try:
+            import numpy as np
+
+            chunk_texts = [chunk.get("text", "") for chunk in chunks]
+            chunk_embeddings = embedding_model.encode(chunk_texts, normalize_embeddings=True)
+            prompt_embedding = embedding_model.encode([prompt], normalize_embeddings=True)[0]
+            scores = np.dot(chunk_embeddings, prompt_embedding)
+        except Exception as exc:
+            self._log("WARN", f"Knowledge embedding retrieval failed, using preview fallback: {exc}")
+            return []
+
+        ranked: list[dict[str, Any]] = []
+        for chunk, score in zip(chunks, scores):
+            enriched = dict(chunk)
+            enriched["score"] = float(score)
+            ranked.append(enriched)
+
+        ranked.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+        return ranked[:max_chunks]
+
+    def _build_knowledge_retrieval_context(
+            self,
+            prompt: str,
+            max_files: int = 8,
+            max_chunks: int = 8,
+            chunk_chars: int = 1800,
+            chunk_overlap: int = 250,
+            fallback_chars_per_file: int = 7000,
+    ) -> str:
+        chat = self._get_current_chat()
+        if chat is None:
+            return ""
+
+        knowledge_files = chat.get("knowledge_files", [])
+        if not knowledge_files:
+            return ""
+
+        available_chunks: list[dict[str, Any]] = []
+        fallback_parts: list[str] = []
+        missing_files: list[str] = []
+        unreadable_files: list[str] = []
+
+        for item in knowledge_files[:max_files]:
+            if isinstance(item, str):
+                path = item
+                name = Path(path).name
+            elif isinstance(item, dict):
+                path = str(item.get("path", ""))
+                name = str(item.get("name", Path(path).name if path else "file"))
+            else:
+                continue
+
+            if not path:
+                continue
+
+            file_path = Path(path)
+
+            if not file_path.exists():
+                missing_files.append(f"{name} ({path})")
+                continue
+
+            content = self._read_knowledge_file_for_retrieval(
+                path,
+                fallback_chars_per_file=None,
+            )
+
+            if not content:
+                unreadable_files.append(f"{name} ({path})")
+                continue
+
+            chunks = self._get_knowledge_chunks_for_file(
+                file_path=file_path,
+                file_name=name,
+                content=content,
+                chunk_chars=chunk_chars,
+                chunk_overlap=chunk_overlap,
+            )
+            available_chunks.extend(chunks)
+
+            fallback_preview = content[:fallback_chars_per_file].strip()
+            if fallback_preview:
+                fallback_parts.append(f"Knowledge file preview for {name}:\n{fallback_preview}")
+
+        if missing_files:
+            fallback_parts.append(
+                "Missing knowledge files:\n" + "\n".join(f"- {item}" for item in missing_files)
+            )
+
+        if unreadable_files:
+            fallback_parts.append(
+                "Unreadable knowledge files:\n" + "\n".join(f"- {item}" for item in unreadable_files)
+            )
+
+        if not available_chunks and not fallback_parts:
+            return ""
+
+        selected_chunks = self._retrieve_relevant_knowledge_chunks(
+            prompt=prompt,
+            chunks=available_chunks,
+            max_chunks=max_chunks,
+        )
+
+        if selected_chunks:
+            lines = [
+                "Persistent knowledge retrieval context for this chat:",
+                "The following chunks were selected from persistent knowledge files using local embedding retrieval with rag-all-minilm-l6-v2 when available.",
+                "Use these as background knowledge only when relevant to the current prompt.",
+            ]
+
+            for index, chunk in enumerate(selected_chunks, start=1):
+                score = float(chunk.get("score", 0.0))
+                file_name = chunk.get("file_name", "file")
+                chunk_number = int(chunk.get("chunk_number", index))
+                source_path = chunk.get("path", "")
+                chunk_text = chunk.get("text", "").strip()
+
+                lines.append(
+                    f"\n[{index}] {file_name} | chunk {chunk_number} | score {score:.3f} | path: {source_path}\n{chunk_text}"
+                )
+
+            if missing_files:
+                lines.append(
+                    "\nMissing knowledge files:\n" + "\n".join(f"- {item}" for item in missing_files)
+                )
+
+            if unreadable_files:
+                lines.append(
+                    "\nUnreadable knowledge files:\n" + "\n".join(f"- {item}" for item in unreadable_files)
+                )
+
+            return "\n".join(lines)
+
+        return (
+                "Persistent knowledge retrieval context for this chat:\n"
+                "Embedding retrieval was unavailable, so SimpleAgent used capped file previews instead.\n"
+                "Use this as background knowledge only when relevant to the current prompt.\n"
+                "If a listed knowledge file is missing, mention that it could not be loaded when relevant.\n\n"
+                + "\n\n".join(fallback_parts)
+        )
+
     def _build_memory_block(self, memory_items: list[dict[str, str]]) -> str:
         if not memory_items:
             return ""
@@ -3356,3 +4175,130 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    def _get_loaded_mlx_model(self, local_model_path: Path) -> tuple[Any, Any]:
+        model_key = str(local_model_path.resolve())
+        with self.loaded_mlx_lock:
+            cached = self.loaded_mlx_models.get(model_key)
+            if cached is not None:
+                return cached
+
+            from mlx_lm import load
+
+            self._log("INFO", f"Loading MLX model into memory: {local_model_path}")
+            model, tokenizer = load(str(local_model_path))
+            self.loaded_mlx_models[model_key] = (model, tokenizer)
+            return model, tokenizer
+
+    def _generate_text_in_process(
+        self,
+        local_model_path: Path,
+        prompt: str,
+        max_tokens: int,
+    ) -> str:
+        from mlx_lm import generate
+
+        model, tokenizer = self._get_loaded_mlx_model(local_model_path)
+        response = generate(
+            model,
+            tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            verbose=False,
+        )
+        return str(response or "")
+
+    def _generate_text_subprocess_fallback(
+        self,
+        local_model_path: Path,
+        prompt: str,
+        max_tokens: int,
+        env: dict[str, str],
+    ) -> str:
+        command = [
+            self.python_executable,
+            "-m",
+            "mlx_lm",
+            "generate",
+            "--model",
+            str(local_model_path),
+            "--prompt",
+            prompt,
+            "--max-tokens",
+            str(max_tokens),
+        ]
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(Path.cwd()),
+            check=False,
+        )
+        if completed.returncode != 0:
+            stderr = completed.stderr.strip()
+            stdout = completed.stdout.strip()
+            detail = stderr or stdout or f"exit code {completed.returncode}"
+            raise RuntimeError(f"MLX subprocess generation failed: {detail}")
+        return completed.stdout
+
+    def _normalise_generation_token_budget(self, max_tokens: int | str) -> int:
+        if isinstance(max_tokens, str):
+            stripped = max_tokens.strip().lower()
+            if stripped in {"", "none", "unlimited"}:
+                return self.max_response_tokens
+            try:
+                value = int(stripped)
+            except ValueError:
+                return self.default_response_tokens
+        else:
+            value = int(max_tokens)
+
+        if value == self.unlimited_response_tokens:
+            return self.max_response_tokens
+        return max(self.min_response_tokens, min(value, self.max_response_tokens))
+
+    def _generate_text_with_budget(
+        self,
+        local_model_path: Path,
+        prompt: str,
+        max_tokens: int | str,
+        env: dict[str, str] | None = None,
+        show_thinking: bool = True,
+    ) -> str:
+        token_budget = self._normalise_generation_token_budget(max_tokens)
+        effective_env = dict(os.environ)
+        if env:
+            effective_env.update(env)
+
+        raw_output = ""
+        try:
+            raw_output = self._generate_text_in_process(
+                local_model_path=local_model_path,
+                prompt=prompt,
+                max_tokens=token_budget,
+            )
+        except Exception as exc:
+            self._log("WARN", f"In-process MLX generation failed, falling back to subprocess: {exc}")
+            raw_output = self._generate_text_subprocess_fallback(
+                local_model_path=local_model_path,
+                prompt=prompt,
+                max_tokens=token_budget,
+                env=effective_env,
+            )
+
+        if self.debug:
+            debug_text = (
+                "\n===== RAW MODEL OUTPUT START =====\n"
+                "==========\n"
+                f"{raw_output}\n"
+                "==========\n"
+                f"Prompt: {len(prompt.split())} rough words\n"
+                f"Generation allowance: {token_budget}\n"
+                "===== RAW MODEL OUTPUT END =====\n"
+            )
+            self._print_debug(debug_text)
+
+        visible_response = self._extract_visible_model_response(raw_output)
+        if show_thinking:
+            self.last_thinking_text = self._extract_thinking_text(raw_output)
+        return visible_response.strip()

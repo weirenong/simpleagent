@@ -6,7 +6,7 @@
 
 SimpleAgent is a local-first desktop AI agent built for Apple Silicon.
 
-It runs small local models with MLX and gives them a practical agent system around them: memory, skill routing, an agent loop, file attachments, web search, URL scraping, vision analysis, text-file reading, PDF reading, code-file reading, and a simple GUI.
+It runs small local models with MLX and gives them a practical agent system around them: memory, skill routing, an agent loop, persistent knowledge retrieval, file attachments, web search, URL scraping, vision analysis, text-file reading, PDF reading, code-file reading, and a simple GUI.
 
 The goal is simple:
 
@@ -27,6 +27,7 @@ It can:
 - search the web when needed
 - scrape user-provided URLs
 - remember recent conversation summaries
+- use persistent per-chat knowledge retrieval with local embeddings
 - use a lightweight agent loop to plan, act, observe, and answer
 - read attached text and config files
 - read attached PDF files
@@ -36,6 +37,7 @@ It can:
 - drag and drop files into the chat
 - pin attachments so they stay available across prompts
 - keep recent coding conversation context for multi-turn code edits
+- retrieve relevant chunks from knowledge files instead of blindly injecting whole files
 - display debug logs and raw model outputs in a console window
 - show response time and token allowance after each reply
 - render markdown-style formatting in the GUI
@@ -124,11 +126,11 @@ In practice, this means:
 | Step | What SimpleAgent does |
 |---|---|
 | Think | Understands the user's intent and what evidence is needed |
-| Act | Runs selected skills such as web search, URL scraping, memory search, attachment reading, vision, PDF reading, or code reading |
-| Observe | Summarises and filters tool results so the final answer focuses on the user's actual request |
+| Act | Runs selected skills such as web search, URL scraping, memory search, knowledge retrieval, attachment reading, vision, PDF reading, or code reading |
+| Observe | Summarises and filters tool, knowledge, and attachment results so the final answer focuses on the user's actual request |
 | Respond | Gives the final answer without exposing the internal loop |
 
-The observation step is only used when it is useful, such as for tool results, PDFs, code files, resumes, documents, and large attachment context. Normal chat stays lightweight.
+The observation step is only used when it is useful, such as for tool results, retrieved knowledge chunks, PDFs, code files, resumes, documents, and large attachment context. Normal chat stays lightweight.
 
 ---
 
@@ -258,6 +260,65 @@ These summaries are used in two ways:
 | Memory RAG | Searches older summaries when the user refers to previous discussion |
 
 This gives the assistant continuity without storing huge full-history prompts.
+
+---
+
+### Persistent Knowledge Retrieval
+
+SimpleAgent supports persistent knowledge files for each chat.
+
+Knowledge files are different from normal attachments:
+
+| Type | Behaviour |
+|---|---|
+| Normal attachments | Used for the current prompt unless pinned |
+| Pinned attachments | Reused across prompts until unpinned or removed |
+| Knowledge files | Saved permanently to the current chat as background reference material |
+
+Knowledge files are managed through the `Knowledge` button near the response token selector.
+
+The knowledge window supports:
+
+- drag and drop files
+- adding files with a file picker
+- removing files with `X`
+- persistent saved file paths per chat
+- red missing-file indicators when a saved path no longer exists
+
+The current knowledge retrieval flow is:
+
+```text
+Add knowledge files to chat
+↓
+Save file paths into the chat file
+↓
+Read supported knowledge files locally
+↓
+Split content into chunks
+↓
+Embed chunks with rag-all-minilm-l6-v2 when available
+↓
+Embed the current user prompt
+↓
+Select the most relevant chunks by similarity
+↓
+Add only the selected chunks to the final prompt
+```
+
+This makes large reference files more useful because SimpleAgent does not need to inject the whole file every time.
+
+Supported knowledge files currently include:
+
+- text files
+- markdown files
+- config files
+- JSON/YAML/CSV-style files
+- code-like files that can be read as text
+- PDFs with extractable text
+
+Image and video knowledge files can be saved as paths, but they are not automatically analysed as persistent knowledge yet.
+
+If embedding retrieval is unavailable, SimpleAgent falls back to capped file previews so the feature still works.
 
 ---
 
@@ -546,6 +607,8 @@ Response generated. Tokens used allowance: 32768 • Time: 46.9s
 
 Hidden helper prompts are kept as small as possible. Memory summarisation now combines the user and assistant summaries in one call to reduce compute.
 
+Knowledge retrieval also reduces prompt size by selecting relevant chunks from persistent files instead of always passing full file contents.
+
 ---
 
 ## Model Setup
@@ -556,13 +619,13 @@ Current model roles:
 |---|---|---|
 | Main reasoning model | Qwen3-4B-Thinking-2507 MLX 4-bit | `mlx-lm` |
 | Vision model | Qwen2.5-VL-3B-Instruct MLX 4-bit | `mlx-vlm` |
-| Embedding model | all-MiniLM-L6-v2 | `sentence-transformers` |
+| Embedding model | rag-all-minilm-l6-v2 / all-MiniLM-L6-v2 | `sentence-transformers` |
 
 The main model handles chat and reasoning.
 
 The vision model handles image and video attachments.
 
-The embedding model helps with semantic ranking for memory and search results.
+The embedding model helps with semantic ranking for memory, search results, and persistent knowledge retrieval.
 
 PDF reading uses local PDF text extraction through Python libraries such as `pypdf`.
 
@@ -685,6 +748,7 @@ SimpleAgent stores local data in these folders:
 | `chats/` | Saved chat files |
 | `models/` | Downloaded local models |
 | `temp_attachments/` | Pasted clipboard images and temporary attachments |
+| `chats/` knowledge file paths | Persistent per-chat knowledge file references are saved inside each chat file |
 
 Recommended `.gitignore` entries:
 
@@ -712,6 +776,8 @@ Prepare date/time context
 ↓
 Prepare recent memory context
 ↓
+Retrieve relevant persistent knowledge chunks
+↓
 Route skills
 ↓
 Run selected skills
@@ -720,7 +786,7 @@ Read or analyse attachments
 ↓
 Build agent loop plan
 ↓
-Observe tool and attachment results when useful
+Observe tool, knowledge, and attachment results when useful
 ↓
 Build final prompt
 ↓
@@ -753,13 +819,17 @@ Instead of relying only on a huge model, SimpleAgent gives a small model better 
 
 File extensions, URLs, and obvious tool triggers should be handled by code, not guessed by the model.
 
-### 4. Make everything visible
+### 4. Retrieve before generating
+
+Persistent knowledge files are searched with embeddings so the model receives the most relevant chunks instead of unnecessary full-file context.
+
+### 5. Make everything visible
 
 The console window shows what the agent is doing internally.
 
 This makes debugging much easier.
 
-### 5. Keep it hackable
+### 6. Keep it hackable
 
 The project is intentionally simple enough to modify and extend.
 
@@ -775,9 +845,11 @@ Known limitations:
 - Some websites may block scraping.
 - JavaScript-heavy pages need Playwright.
 - Vision analysis requires the correct MLX-VLM model and dependencies.
-- Text, PDF, and code attachments can become very large and slow down responses.
+- Text, PDF, code attachments, and knowledge files can become very large and slow down responses, though knowledge retrieval reduces this by selecting relevant chunks.
 - The code skill can suggest patch-style edits, but automatic patch application is not yet part of the core workflow.
 - PDF reading works best for PDFs with extractable text; scanned PDFs may need image conversion or vision analysis.
+- Persistent knowledge retrieval currently stores file paths, so moving or deleting a knowledge file will mark it as missing.
+- Knowledge retrieval currently uses local chunk similarity; a dedicated reranker is not yet included.
 - DOCX, XLSX, and PPTX files are not deeply parsed yet unless converted or handled through future skills.
 
 ---
