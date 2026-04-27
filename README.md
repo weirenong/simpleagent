@@ -43,6 +43,7 @@ It can:
 - display debug logs and raw model outputs in a console window
 - show response time and token allowance after each reply
 - render markdown-style formatting in the GUI
+- propose file edits or new files using reviewable apply-patch diffs
 
 ---
 
@@ -627,6 +628,18 @@ The GUI includes response token options.
 This is useful because thinking models can use many tokens before producing the final answer.
 
 The app also shows response time after each reply, for example:
+
+---
+
+### File Editing
+
+SimpleAgent can propose edits to text/code files using an apply-patch style diff block.
+
+When file edits are detected, SimpleAgent shows a review popup with the proposed patch. You can apply or cancel the changes. If `Auto apply edits` is enabled below the Send button, SimpleAgent applies detected edits immediately without showing the popup.
+
+File editing is limited to text-like and code-like files. New files are created inside the current chat workspace folder unless the user is editing an attached editable file.
+
+---
 
 ```text
 Response generated. Tokens used allowance: 32768 • Time: 46.9s

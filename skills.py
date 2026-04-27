@@ -15,7 +15,7 @@ from typing import Any
 BASE_DIR = Path(__file__).resolve().parent
 RAG_MODEL_PATH = BASE_DIR / "models" / "rag-all-minilm-l6-v2" / "model"
 _EMBEDDING_MODEL: Any | None = None
-DEBUG_SEARCH_FETCH = True
+DEBUG_SEARCH_FETCH = False
 USE_PLAYWRIGHT_FETCH = True
 PLAYWRIGHT_TIMEOUT_MS = 12_000
 SEARCH_DEFAULT_MAX_RESULTS = 8
@@ -134,12 +134,14 @@ def get_all_skills() -> str:
             "4: attachment_vision - Analyse attached images or videos with the local VL model when the user attaches visual files or asks about an attachment.",
             "5: text_file_reader - Read attached plain-text, markdown, code, config, CSV, JSON, HTML, CSS, SQL, shell, YAML, and other text-like files from local file paths.",
             "6: pdf_reader - Read text from attached PDF files using local PDF text extraction.",
-            "7: code_reader - Read attached code files and provide coding, debugging, refactoring, code review, implementation, and patch-style guidance."
+            "7: code_reader - Read attached code files and provide coding, debugging, refactoring, code review, implementation, and patch-style guidance.",
+            "8: file_editor - Create or edit text/code files by producing an apply-patch style diff for attached files or files inside the current chat workspace."
+
         ]
     )
 
 def get_valid_skill_ids() -> set[int]:
-    return {0, 1, 2, 3, 4, 5, 6, 7}
+    return {0, 1, 2, 3, 4, 5, 6, 7, 8}
 
 
 def execute_skill(skill_id: int, user_prompt: str, memory_items: list[dict[str, str]] | None = None) -> str:
@@ -160,6 +162,9 @@ def execute_skill(skill_id: int, user_prompt: str, memory_items: list[dict[str, 
         return ""
     if skill_id == 7:
         # Code reading is executed inside simple_agent.py because it needs access to local attachment paths and coding context.
+        return ""
+    if skill_id == 8:
+        # File editing is executed inside simple_agent.py because it needs chat workspace paths, attachment paths, user approval, and local file access.
         return ""
     return ""
 

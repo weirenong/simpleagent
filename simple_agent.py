@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shutil
+import difflib
 import subprocess
 import sys
 import threading
@@ -130,6 +131,8 @@ class SimpleAgentGUI:
         self.pending_attachments: list[dict[str, str]] = []
         self.pending_knowledge_files: list[dict[str, Any]] = []
         self.current_chat_directive: str = ""
+        self.auto_apply_file_edits_var: tk.BooleanVar | None = None
+        self.last_file_edit_report = ""
         self.knowledge_embedding_model: Any | None = None
         self.knowledge_chunk_cache: dict[str, dict[str, Any]] = {}
         self.loaded_mlx_models: dict[str, tuple[Any, Any]] = {}
@@ -184,6 +187,7 @@ class SimpleAgentGUI:
             self.root = TkinterDnD.Tk()
         else:
             self.root = tk.Tk()
+        self.auto_apply_file_edits_var = tk.BooleanVar(master=self.root, value=False)
         self.root.title("Simple Agent")
         self.root.geometry("1280x820")
         self.root.minsize(960, 640)
@@ -905,6 +909,10 @@ class SimpleAgentGUI:
             spacing1=10,
             spacing3=12,
         )
+        self.transcript.tag_configure("patch_add", background="#183d25", foreground="#b9f6ca")
+        self.transcript.tag_configure("patch_remove", background="#4a1f25", foreground="#ffb3b3")
+        self.transcript.tag_configure("patch_header", background="#252a31", foreground="#c5d1e0")
+        self.transcript.tag_configure("patch_context", foreground="#d8dee9")
 
         self.composer = ttk.Frame(self.main, style="Composer.TFrame")
         self.composer.grid(row=2, column=0, sticky="ew", padx=20, pady=(6, 12))
@@ -966,6 +974,13 @@ class SimpleAgentGUI:
             width=8,
         )
         self.send_button.grid(row=0, column=1, sticky="e")
+
+        self.auto_apply_file_edits_checkbox = ttk.Checkbutton(
+            self.composer,
+            text="Auto apply edits",
+            variable=self.auto_apply_file_edits_var,
+        )
+        self.auto_apply_file_edits_checkbox.grid(row=3, column=0, sticky="e", padx=(8, 0), pady=(8, 0))
 
         self.status_label = ttk.Label(
             self.main,
@@ -1501,6 +1516,35 @@ class SimpleAgentGUI:
             )
         )
 
+    def _insert_transcript_content_with_diff_highlighting(self, content: str) -> None:
+        lines = content.splitlines()
+        inside_patch = False
+        for line in lines:
+            stripped = line.strip().lower()
+            if stripped.startswith("```patch") or stripped.startswith("```diff"):
+                inside_patch = True
+                self.transcript.insert(tk.END, line + "\n", "patch_header")
+                continue
+            if inside_patch and stripped == "```":
+                inside_patch = False
+                self.transcript.insert(tk.END, line + "\n", "patch_header")
+                continue
+
+            if inside_patch or line.startswith("*** Begin Patch") or line.startswith("*** End Patch") or line.startswith("*** Add File:") or line.startswith("*** Update File:") or line.startswith("@@"):
+                tag = self._patch_line_tag(line)
+                self.transcript.insert(tk.END, line + "\n", tag)
+            else:
+                self.transcript.insert(tk.END, line + "\n", "body")
+
+    def _patch_line_tag(self, line: str) -> str:
+        if line.startswith("+") and not line.startswith("+++"):
+            return "patch_add"
+        if line.startswith("-") and not line.startswith("---"):
+            return "patch_remove"
+        if line.startswith("***") or line.startswith("@@") or line.startswith("+++") or line.startswith("---"):
+            return "patch_header"
+        return "patch_context"
+
     def _append_message_to_transcript(self, message: dict[str, Any], clear_placeholder: bool = False) -> None:
         if clear_placeholder:
             self.transcript.delete("1.0", tk.END)
@@ -1589,6 +1633,15 @@ class SimpleAgentGUI:
                 self._insert_clickable_link(path, f"file://{path}", "bullet")
             self.transcript.insert(tk.END, "\n")
 
+    def _insert_patch_code_block(self, patch_text: str) -> None:
+        if not patch_text:
+            self.transcript.insert(tk.END, "\n", "patch_context")
+            return
+
+        for line in patch_text.splitlines():
+            tag = self._patch_line_tag(line)
+            self.transcript.insert(tk.END, line + "\n", tag)
+
     def _insert_formatted_message(self, content: str) -> None:
         if not content:
             self.transcript.insert(tk.END, "\n", "body")
@@ -1597,6 +1650,7 @@ class SimpleAgentGUI:
         lines = content.splitlines()
         index = 0
         in_code_block = False
+        code_block_language = ""
         code_lines: list[str] = []
 
         while index < len(lines):
@@ -1615,15 +1669,22 @@ class SimpleAgentGUI:
             if stripped.startswith("```"):
                 if in_code_block:
                     code_text = "\n".join(code_lines).rstrip()
-                    if code_text:
+
+                    if code_block_language in {"patch", "diff"}:
+                        self._insert_patch_code_block(code_text)
+                    elif code_text:
                         self.transcript.insert(tk.END, f"{code_text}\n", "code_block")
                     else:
                         self.transcript.insert(tk.END, "\n", "code_block")
+
                     code_lines = []
+                    code_block_language = ""
                     in_code_block = False
                 else:
                     in_code_block = True
+                    code_block_language = stripped[3:].strip().lower().split()[0] if stripped[3:].strip() else ""
                     code_lines = []
+
                 index += 1
                 continue
 
@@ -1693,7 +1754,10 @@ class SimpleAgentGUI:
 
         if in_code_block:
             code_text = "\n".join(code_lines).rstrip()
-            if code_text:
+
+            if code_block_language in {"patch", "diff"}:
+                self._insert_patch_code_block(code_text)
+            elif code_text:
                 self.transcript.insert(tk.END, f"{code_text}\n", "code_block")
 
 
@@ -2365,14 +2429,19 @@ class SimpleAgentGUI:
             )
             return
 
-        assistant_message = {"role": "assistant", "content": response}
-        chat.setdefault("messages", []).append(assistant_message)
-        self._remember_turn(chat, prompt, response)
-
         title_changed = False
         if self._should_generate_title(chat) and title:
             chat["title"] = title
             title_changed = True
+            self._save_chat(chat)
+
+        edit_report = self._handle_file_edits_from_response(chat, response)
+        if edit_report:
+            response = response.rstrip() + "\n\nFile edit result:\n" + edit_report
+
+        assistant_message = {"role": "assistant", "content": response}
+        chat.setdefault("messages", []).append(assistant_message)
+        self._remember_turn(chat, prompt, response)
 
         self._save_chat(chat)
         self._refresh_chat_list()
@@ -2386,6 +2455,365 @@ class SimpleAgentGUI:
             f"Response generated. Tokens used allowance: {self._format_token_budget(self.last_response_token_budget)} • "
             f"Time: {self._format_response_time(self.last_response_seconds)}"
         )
+
+    def _handle_file_edits_from_response(self, chat: dict[str, Any], response: str) -> str:
+        patch_texts = self._extract_apply_patch_blocks(response)
+        if not patch_texts:
+            self.last_file_edit_report = ""
+            return ""
+
+        combined_patch = "\n\n".join(patch_texts).strip()
+        if not combined_patch:
+            self.last_file_edit_report = ""
+            return ""
+
+        if self.auto_apply_file_edits_var is not None and self.auto_apply_file_edits_var.get():
+            report = self._apply_file_edit_patch(chat, combined_patch)
+            self.last_file_edit_report = report
+            return report
+
+        accepted = self._show_file_edit_review_popup(combined_patch)
+        if not accepted:
+            self.last_file_edit_report = "File edits were not applied."
+            return self.last_file_edit_report
+
+        report = self._apply_file_edit_patch(chat, combined_patch)
+        self.last_file_edit_report = report
+        return report
+
+    def _extract_apply_patch_blocks(self, response: str) -> list[str]:
+        blocks: list[str] = []
+        fenced_pattern = r"```(?:patch|diff)?\s*(\*\*\* Begin Patch[\s\S]*\*\*\* End Patch)\s*```"
+
+        for match in re.finditer(fenced_pattern, response, flags=re.IGNORECASE):
+            blocks.append(match.group(1).strip())
+
+        if blocks:
+            return blocks
+
+        raw_match = re.search(r"(\*\*\* Begin Patch[\s\S]*\*\*\* End Patch)", response)
+        if raw_match:
+            blocks.append(raw_match.group(1).strip())
+
+        return blocks
+
+    def _show_file_edit_review_popup(self, patch_text: str) -> bool:
+        decision = {"accepted": False}
+
+        popup = tk.Toplevel(self.root)
+        popup.title("Review File Edits")
+        popup.geometry("950x680")
+        root_bg = self.root.cget("bg") or "#202123"
+        popup.configure(bg=root_bg)
+        popup.transient(self.root)
+        popup.grab_set()
+
+        container = ttk.Frame(popup, padding=12, style="Main.TFrame")
+        container.pack(fill="both", expand=True)
+
+        title = ttk.Label(container, text="Review proposed file edits", style="Heading.TLabel")
+        title.pack(anchor="w")
+
+        description = ttk.Label(
+            container,
+            text="Green lines are additions (+), red lines are removals (-), and grey lines are patch headers or unchanged context.",
+            style="Meta.TLabel",
+            wraplength=860,
+        )
+        description.pack(anchor="w", pady=(4, 10))
+
+        text_frame = ttk.Frame(container, style="Main.TFrame")
+        text_frame.pack(fill="both", expand=True)
+
+        y_scrollbar = ttk.Scrollbar(text_frame, orient="vertical")
+        y_scrollbar.pack(side="right", fill="y")
+        x_scrollbar = ttk.Scrollbar(text_frame, orient="horizontal")
+        x_scrollbar.pack(side="bottom", fill="x")
+
+        text_box = tk.Text(
+            text_frame,
+            wrap="none",
+            bg="#151618",
+            fg="#e7eee8",
+            insertbackground="#e7eee8",
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=12,
+            font=("Menlo", 12),
+            yscrollcommand=y_scrollbar.set,
+            xscrollcommand=x_scrollbar.set,
+        )
+        text_box.pack(side="left", fill="both", expand=True)
+        y_scrollbar.config(command=text_box.yview)
+        x_scrollbar.config(command=text_box.xview)
+
+        text_box.tag_configure("patch_add", background="#183d25", foreground="#b9f6ca")
+        text_box.tag_configure("patch_remove", background="#4a1f25", foreground="#ffb3b3")
+        text_box.tag_configure("patch_header", background="#252a31", foreground="#c5d1e0")
+        text_box.tag_configure("patch_context", foreground="#d8dee9")
+
+
+        for line in patch_text.splitlines():
+            tag = "patch_context"
+            if line.startswith("+") and not line.startswith("+++"):
+                tag = "patch_add"
+            elif line.startswith("-") and not line.startswith("---"):
+                tag = "patch_remove"
+            elif line.startswith("***") or line.startswith("@@") or line.startswith("+++") or line.startswith("---"):
+                tag = "patch_header"
+            text_box.insert(tk.END, line + "\n", tag)
+
+        text_box.configure(state="disabled")
+
+        footer = ttk.Frame(container, style="Main.TFrame")
+        footer.pack(fill="x", pady=(10, 0))
+
+        def reject() -> None:
+            decision["accepted"] = False
+            popup.destroy()
+
+        def accept() -> None:
+            decision["accepted"] = True
+            popup.destroy()
+
+        ttk.Button(footer, text="Cancel", command=reject).pack(side="right", padx=(8, 0))
+        ttk.Button(footer, text="Apply", command=accept).pack(side="right")
+
+        popup.protocol("WM_DELETE_WINDOW", reject)
+        self.root.wait_window(popup)
+        return bool(decision["accepted"])
+
+    def _apply_file_edit_patch(self, chat: dict[str, Any], patch_text: str) -> str:
+        operations = self._parse_apply_patch_operations(patch_text)
+        if not operations:
+            return "No valid file edit operations were found."
+
+        reports: list[str] = []
+
+        for operation in operations:
+            action = operation.get("action", "")
+            raw_path = str(operation.get("path", ""))
+            target_path = self._resolve_edit_target_path(chat, raw_path)
+
+            if target_path is None:
+                reports.append(f"Skipped {raw_path}: path is outside allowed editable locations.")
+                continue
+
+            if not self._file_extension_is_editable(str(target_path)):
+                reports.append(f"Skipped {target_path}: file type is not editable.")
+                continue
+
+            try:
+                if action == "add":
+                    content = str(operation.get("content", ""))
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    if target_path.exists():
+                        reports.append(f"Skipped {target_path}: file already exists.")
+                        continue
+
+                    target_path.write_text(content, encoding="utf-8")
+                    reports.append(f"Created {target_path}")
+
+                elif action == "update":
+                    if not target_path.exists():
+                        reports.append(f"Skipped {target_path}: file does not exist.")
+                        continue
+
+                    original = target_path.read_text(encoding="utf-8")
+                    updated = self._apply_unified_hunks(original, operation.get("hunks", []))
+
+                    if updated is None:
+                        reports.append(
+                            f"Skipped {target_path}: patch context did not match. "
+                            "Ask again after attaching the latest file or ensure the patch includes exact unchanged context lines."
+                        )
+                        continue
+
+                    target_path.write_text(updated, encoding="utf-8")
+                    reports.append(f"Updated {target_path}")
+
+            except Exception as exc:
+                reports.append(f"Failed {target_path}: {exc}")
+
+        return "\n".join(reports)
+
+    def _parse_apply_patch_operations(self, patch_text: str) -> list[dict[str, Any]]:
+        lines = patch_text.splitlines()
+        operations: list[dict[str, Any]] = []
+        index = 0
+
+        while index < len(lines):
+            line = lines[index]
+
+            if line.startswith("*** Add File: "):
+                path = line.split(": ", 1)[1].strip()
+                index += 1
+                content_lines: list[str] = []
+
+                while index < len(lines) and not lines[index].startswith("*** "):
+                    content_line = lines[index]
+                    if content_line.startswith("+"):
+                        content_line = content_line[1:]
+                    content_lines.append(content_line)
+                    index += 1
+
+                operations.append(
+                    {
+                        "action": "add",
+                        "path": path,
+                        "content": "\n".join(content_lines).rstrip() + "\n",
+                    }
+                )
+                continue
+
+            if line.startswith("*** Update File: "):
+                path = line.split(": ", 1)[1].strip()
+                index += 1
+                hunk_lines: list[str] = []
+
+                while index < len(lines) and not lines[index].startswith("*** "):
+                    hunk_lines.append(lines[index])
+                    index += 1
+
+                operations.append({"action": "update", "path": path, "hunks": hunk_lines})
+                continue
+
+            index += 1
+
+        return operations
+
+    def _resolve_edit_target_path(self, chat: dict[str, Any], raw_path: str) -> Path | None:
+        if not raw_path:
+            return None
+
+        candidate = Path(raw_path).expanduser()
+
+        if not candidate.is_absolute():
+            workspace = self._ensure_chat_workspace_folder(chat)
+            candidate = workspace / candidate
+
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            return None
+
+        allowed_roots = [self._ensure_chat_workspace_folder(chat).resolve()]
+
+        for message in chat.get("messages", []):
+            for attachment in message.get("attachments", []):
+                attachment_path = str(attachment.get("path", ""))
+                if attachment_path and self._file_extension_is_editable(attachment_path):
+                    try:
+                        allowed_roots.append(Path(attachment_path).expanduser().resolve())
+                    except Exception:
+                        pass
+
+        for root in allowed_roots:
+            if resolved == root:
+                return resolved
+
+            if root.is_dir():
+                try:
+                    resolved.relative_to(root)
+                    return resolved
+                except ValueError:
+                    pass
+
+        return None
+
+    def _file_extension_is_editable(self, file_path: str) -> bool:
+        extension = self._attachment_extension(Path(file_path))
+        return extension in self.text_attachment_extensions or extension in self.code_attachment_extensions
+
+    def _apply_unified_hunks(self, original: str, hunk_lines: Any) -> str | None:
+        if not isinstance(hunk_lines, list):
+            return None
+
+        original_lines = original.splitlines()
+        updated_lines = original_lines[:]
+        search_start = 0
+        index = 0
+
+        while index < len(hunk_lines):
+            hunk_header = ""
+
+            if hunk_lines[index].startswith("@@"):
+                hunk_header = hunk_lines[index]
+                index += 1
+
+            old_block: list[str] = []
+            new_block: list[str] = []
+
+            while index < len(hunk_lines) and not hunk_lines[index].startswith("@@"):
+                line = hunk_lines[index]
+
+                if line.startswith("-"):
+                    old_block.append(line[1:])
+                elif line.startswith("+"):
+                    new_block.append(line[1:])
+                elif line.startswith(" "):
+                    old_block.append(line[1:])
+                    new_block.append(line[1:])
+                elif line == "":
+                    old_block.append("")
+                    new_block.append("")
+                else:
+                    old_block.append(line)
+                    new_block.append(line)
+
+                index += 1
+
+            if not old_block and not new_block:
+                continue
+
+            match_index = self._find_subsequence(updated_lines, old_block, search_start)
+
+            if match_index < 0:
+                line_number_index = self._hunk_start_index_from_header(hunk_header)
+
+                if line_number_index is not None and 0 <= line_number_index <= len(updated_lines):
+                    candidate = updated_lines[line_number_index:line_number_index + len(old_block)]
+
+                    if old_block and candidate == old_block:
+                        match_index = line_number_index
+                    elif not old_block:
+                        match_index = line_number_index
+
+            if match_index < 0:
+                return None
+
+            updated_lines[match_index:match_index + len(old_block)] = new_block
+            search_start = match_index + len(new_block)
+
+        trailing_newline = "\n" if original.endswith("\n") else ""
+        return "\n".join(updated_lines) + trailing_newline
+
+    def _hunk_start_index_from_header(self, hunk_header: str) -> int | None:
+        if not hunk_header:
+            return None
+
+        match = re.search(r"@@\s+-(\d+)(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@", hunk_header)
+
+        if not match:
+            return None
+
+        try:
+            return max(0, int(match.group(1)) - 1)
+        except Exception:
+            return None
+
+    def _find_subsequence(self, lines: list[str], pattern: list[str], start: int = 0) -> int:
+        if not pattern:
+            return start
+
+        max_index = len(lines) - len(pattern)
+        for index in range(start, max_index + 1):
+            if lines[index:index + len(pattern)] == pattern:
+                return index
+
+        return -1
 
     def _chat_by_id(self, chat_id: str) -> dict[str, Any] | None:
         for chat in self.state.chats:
@@ -2416,6 +2844,7 @@ class SimpleAgentGUI:
             5: "text_file_reader",
             6: "pdf_reader",
             7: "code_reader",
+            8: "file_editor",
         }
 
         selected_skills = [skill_names.get(skill_id, f"unknown_{skill_id}") for skill_id in skill_ids]
@@ -2487,8 +2916,8 @@ class SimpleAgentGUI:
             self.root.after(0, lambda: self._set_loading_base("Observing skill results"))
             observation = self._generate_text_with_budget(
                 local_model_path=local_model_path,
-                prompt=observation_prompt,
-                max_tokens=self.default_response_tokens,
+                prompt=self._build_no_think_prompt(observation_prompt),
+                max_tokens=self.observation_token_budget,
                 env=env,
                 show_thinking=False,
             )
@@ -2872,6 +3301,129 @@ class SimpleAgentGUI:
         }
         return len(prompt_lower) <= 120 or prompt_lower in simple_markers
 
+    def _build_file_editing_instructions(self, attachments: list[dict[str, Any]]) -> str:
+        chat = self._get_current_chat()
+        workspace = self._ensure_chat_workspace_folder(chat) if chat is not None else self.chats_dir
+
+        editable_paths: list[Path] = []
+
+        for attachment in attachments:
+            path = str(attachment.get("path", ""))
+            if path and self._file_extension_is_editable(path):
+                try:
+                    editable_paths.append(Path(path).expanduser().resolve())
+                except Exception:
+                    editable_paths.append(Path(path).expanduser())
+
+        editable_paths.extend(self._workspace_editable_files(workspace))
+
+        deduped_paths: list[Path] = []
+        seen_paths: set[str] = set()
+
+        for path in editable_paths:
+            key = str(path)
+            if key not in seen_paths:
+                seen_paths.add(key)
+                deduped_paths.append(path)
+
+        file_context = self._build_file_editing_file_context(deduped_paths)
+
+        return (
+            "File editing rules:\n"
+            "- This is a file-editing request. Output ONLY one fenced apply-patch block and no extra explanation.\n"
+            "- You are allowed to create or edit text/code-like files only.\n"
+            "- Create new files inside the current chat workspace unless the user clearly asks to edit an attached editable file.\n"
+            "- If an editable file is attached and the user says edit this / change this / update it / fix it, update the attached file.\n"
+            "- If a relevant editable file already exists in the current chat workspace, update that file instead of inventing a new one.\n"
+            "- Use the exact current file content below when writing update hunks. Do not guess file contents from memory.\n"
+            "- Use standard diff symbols: `-` for removed lines, `+` for added lines, and leading space for unchanged context.\n"
+            "- Every changed line in an Update File hunk must be paired with enough exact unchanged context lines from the current file.\n"
+            "- For edits far apart, use multiple `@@` hunks under the same `*** Update File:` block.\n"
+            "- For new files, use this format exactly:\n"
+            "```patch\n"
+            "*** Begin Patch\n"
+            "*** Add File: hello.py\n"
+            "+print(\"Hello, World!\")\n"
+            "*** End Patch\n"
+            "```\n"
+            "- For editing existing files, use this format exactly:\n"
+            "```patch\n"
+            "*** Begin Patch\n"
+            "*** Update File: hello.py\n"
+            "@@\n"
+            " print(\"Calculator\")\n"
+            "-op = input(\"Enter operator (+, -, *, /): \")\n"
+            "+op = input(\"Enter operator (+, -, *, /, ^): \")\n"
+            " if op == '+':\n"
+            "*** End Patch\n"
+            "```\n"
+            "- Do not output only the final file content when a file edit is requested. Output the patch block.\n"
+            "- Do not say the file was created or edited. SimpleAgent will report the file edit result after applying the patch.\n"
+            f"Current chat workspace: {workspace}\n"
+            f"Editable files available: {', '.join(str(path) for path in deduped_paths) if deduped_paths else 'none'}\n"
+            f"{file_context}"
+        )
+
+    def _workspace_editable_files(self, workspace: Path, max_files: int = 8) -> list[Path]:
+        if not workspace.exists() or not workspace.is_dir():
+            return []
+
+        ignored_names = {self.chat_payload_filename}
+        files: list[Path] = []
+
+        try:
+            for path in sorted(
+                    workspace.iterdir(),
+                    key=lambda item: item.stat().st_mtime if item.exists() else 0,
+                    reverse=True,
+            ):
+                if len(files) >= max_files:
+                    break
+
+                if not path.is_file():
+                    continue
+
+                if path.name in ignored_names or path.name.endswith(".zst"):
+                    continue
+
+                if self._file_extension_is_editable(str(path)):
+                    files.append(path.resolve())
+
+        except Exception:
+            return files
+
+        return files
+
+    def _build_file_editing_file_context(
+            self,
+            file_paths: list[Path],
+            max_chars_per_file: int = 12000,
+    ) -> str:
+        if not file_paths:
+            return "Editable file contents:\nnone"
+
+        sections: list[str] = ["Editable file contents:"]
+
+        for path in file_paths:
+            try:
+                content = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                try:
+                    content = path.read_text(encoding="utf-8", errors="replace")
+                except Exception as exc:
+                    sections.append(f"\n--- FILE: {path}\nCould not read file: {exc}")
+                    continue
+            except Exception as exc:
+                sections.append(f"\n--- FILE: {path}\nCould not read file: {exc}")
+                continue
+
+            if len(content) > max_chars_per_file:
+                content = content[:max_chars_per_file] + "\n... [truncated for prompt size]"
+
+            sections.append(f"\n--- FILE: {path}\n{content}")
+
+        return "\n".join(sections)
+
     def _run_prompt(
         self,
         prompt: str,
@@ -2914,11 +3466,14 @@ class SimpleAgentGUI:
         observation_attachment_context = "\n\n".join(
             part for part in [knowledge_context, attachment_context] if part
         )
-        observation_context = self._build_agent_observation_summary(
-            prompt,
-            skill_context,
-            observation_attachment_context,
-        )
+        if 8 in skill_ids:
+            observation_context = ""
+        else:
+            observation_context = self._build_agent_observation_summary(
+                prompt,
+                skill_context,
+                observation_attachment_context,
+            )
 
         self.root.after(0, lambda: self._set_loading_base("Building prompt"))
         prompt_parts: list[str] = [
@@ -2942,6 +3497,9 @@ class SimpleAgentGUI:
             code_conversation_context = self._build_code_conversation_context(prompt)
             if code_conversation_context:
                 prompt_parts.append(code_conversation_context)
+
+        if 8 in skill_ids:
+            prompt_parts.append(self._build_file_editing_instructions(attachments or []))
 
         if agent_loop_plan:
             prompt_parts.append(agent_loop_plan)
@@ -3004,6 +3562,12 @@ class SimpleAgentGUI:
                 directive_context=directive_context,
         ):
             prompt_parts.append(self._build_fast_response_instruction())
+        if 8 in skill_ids:
+            prompt_parts.append(
+                "Response mode:\n"
+                "/no_think\n"
+                "Return only one fenced ```patch block. Do not include reasoning, commentary, analysis, or a prose summary."
+            )
         final_prompt = "\n\n".join(part for part in prompt_parts if part)
         response_token_budget = self.selected_response_tokens
         if response_token_budget != self.unlimited_response_tokens:
@@ -3229,6 +3793,74 @@ class SimpleAgentGUI:
     def _current_prompt_has_vl_attachments(self, attachments: list[dict[str, str]] | None = None) -> bool:
         return 4 in self._attachment_skill_ids(attachments)
 
+    def _prompt_requests_file_editing(self, prompt: str) -> bool:
+        prompt_lower = prompt.lower().strip()
+        if not prompt_lower:
+            return False
+
+        direct_markers = (
+            "write it to a new file",
+            "write this to a new file",
+            "save it to a new file",
+            "save this to a new file",
+            "put it in a file",
+            "put this in a file",
+            "create a file",
+            "create new file",
+            "create a new file",
+            "new file",
+            "write file",
+            "save file",
+            "edit file",
+            "edit this",
+            "edit it",
+            "modify file",
+            "modify this",
+            "modify it",
+            "update file",
+            "update the file",
+            "update this",
+            "update it",
+            "change the file",
+            "change this",
+            "change it",
+            "replace this",
+            "replace it",
+            "remove this",
+            "remove it",
+            "apply patch",
+            "make changes",
+            "generate a file",
+            "create a script",
+            "write a script",
+            "save as",
+        )
+        if any(marker in prompt_lower for marker in direct_markers):
+            return True
+
+        action_words = (
+        "create", "write", "generate", "save", "make", "edit", "modify", "update", "change", "replace", "remove")
+        target_words = (
+            "file", "script", "module", "this", "it",
+            ".py", ".js", ".ts", ".md", ".txt", ".json",
+            ".html", ".css", ".sql", ".sh",
+        )
+        return any(action in prompt_lower for action in action_words) and any(
+            target in prompt_lower for target in target_words)
+
+    def _prompt_requests_editing_attached_file(self, prompt: str, attachments: list[dict[str, Any]] | None) -> bool:
+        if not attachments:
+            return False
+        if not any(self._file_extension_is_editable(str(attachment.get("path", ""))) for attachment in attachments):
+            return False
+
+        prompt_lower = prompt.lower().strip()
+        edit_markers = (
+            "edit", "change", "modify", "update", "replace", "remove", "delete",
+            "rewrite", "refactor", "patch", "fix", "make it", "turn it", "instead",
+        )
+        return any(marker in prompt_lower for marker in edit_markers)
+
     def _decide_skill_ids(
         self,
         prompt: str,
@@ -3255,10 +3887,16 @@ class SimpleAgentGUI:
         if self._prompt_needs_code_skill(prompt):
             deterministic_ids.append(7)
 
+        if (self._prompt_requests_file_editing(prompt) or
+                self._prompt_requests_editing_attached_file(prompt, attachments)):
+            deterministic_ids.append(8)
+
         deterministic_ids.extend(self._attachment_skill_ids(attachments))
 
         if deterministic_ids:
-            selected_ids = list(dict.fromkeys(deterministic_ids))
+            selected_ids = sorted(set(deterministic_ids))
+            if len(selected_ids) > 1 and 0 in selected_ids:
+                selected_ids.remove(0)
             self._debug_skill_decision("rule", selected_ids, prompt, "Rule-based skill selection")
             return selected_ids
 
@@ -3279,7 +3917,8 @@ class SimpleAgentGUI:
             "Use 4 when the user has attached an image/video or asks to analyse an attached visual file.\n"
             "Use 5 when the user has attached a readable text/code/config file such as txt, md, py, json, csv, html, css, js, sql, sh, yaml, or similar.\n"
             "Use 6 when the user has attached a PDF file or asks to read, summarise, extract, or analyse an attached PDF.\n"
-            "Use 7 when the user asks to code, debug, refactor, edit, implement, patch, review code, or when a code file is attached.\n"
+            "Use 7 when the user asks for coding guidance, debugging, refactoring, code review, or implementation advice, or when a code file is attached.\n"
+            "Use 8 when the user asks to create, write, save, edit, update, modify, or apply changes to a text/code file.\n"
             "Use 0 for normal conversation, opinions, follow-up questions, UI changes, reasoning, writing, summarising, or anything answerable from the existing chat without tools.\n"
             "For short follow-ups like 'what do you think', 'explain more', 'continue', or 'is it bullish or bearish', choose 0 unless the user also explicitly asks to search online.\n"
             "When unsure, choose 0.\n\n"
@@ -3314,6 +3953,16 @@ class SimpleAgentGUI:
 
         self._debug_skill_decision("model", parsed_ids, prompt, decision_text)
 
+        edit_markers = (
+            "edit file", "create file", "write file", "save file", "modify file", "apply patch",
+            "make changes", "update the file", "change the file", "generate a file", "create a script",
+        )
+        if any(marker in prompt.lower() for marker in edit_markers) and 8 not in parsed_ids:
+            parsed_ids.append(8)
+
+        if len(parsed_ids) > 1 and 0 in parsed_ids:
+            parsed_ids.remove(0)
+
         return parsed_ids
 
     def _debug_skill_decision(
@@ -3335,6 +3984,7 @@ class SimpleAgentGUI:
             5: "text_file_reader",
             6: "pdf_reader",
             7: "code_reader",
+            8: "file_editor",
         }
         readable_skills = [skill_catalog.get(skill_id, f"unknown_{skill_id}") for skill_id in skill_ids]
         if not readable_skills:
@@ -3511,6 +4161,15 @@ class SimpleAgentGUI:
             "edit code": 7,
             "patch code": 7,
             "review code": 7,
+            "file_editor": 8,
+            "file editor": 8,
+            "file edit": 8,
+            "file editing": 8,
+            "create file": 8,
+            "write file": 8,
+            "save file": 8,
+            "edit file": 8,
+            "apply patch": 8,
         }
 
         for name, skill_id in skill_name_map.items():
@@ -3651,6 +4310,26 @@ class SimpleAgentGUI:
                             "\n===== SKILL EXECUTION START =====\n"
                             f"Skill id: {skill_id}\n"
                             "Skill input: code intent or attached code files\n"
+                            "Skill output:\n"
+                            f"{result}\n"
+                            "===== SKILL EXECUTION END =====\n"
+                        )
+                        self._print_debug(debug_text)
+
+                    outputs.append(f"Skill {skill_id} output:\n{result}")
+                    continue
+                elif skill_id == 8:
+                    self.root.after(0, lambda: self._set_loading_base("Preparing file edit"))
+                    current_chat = self._get_current_chat()
+                    workspace = self._ensure_chat_workspace_folder(
+                        current_chat) if current_chat is not None else self.chats_dir
+                    result = f"File editing is enabled. New text/code files should be created in the current chat workspace: {workspace}"
+
+                    if self.debug:
+                        debug_text = (
+                            "\n===== SKILL EXECUTION START =====\n"
+                            f"Skill id: {skill_id}\n"
+                            "Skill input: file creation or file editing intent\n"
                             "Skill output:\n"
                             f"{result}\n"
                             "===== SKILL EXECUTION END =====\n"
