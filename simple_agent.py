@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import webbrowser
+import zstandard as zstd
 from dataclasses import dataclass, field
 from functools import partial
 from datetime import datetime
@@ -101,6 +102,8 @@ class SimpleAgentGUI:
         self.models_dir.mkdir(exist_ok=True)
         self.chats_dir = Path("chats")
         self.chats_dir.mkdir(exist_ok=True)
+        self.chat_compression_level = 3
+        self.chat_payload_filename = "chat.json.zst"
         self.temp_attachments_dir = Path("temp_attachments")
         self.temp_attachments_dir.mkdir(exist_ok=True)
         self.active_prompt_model_key = "qwen3-4b-thinking-2507"
@@ -113,7 +116,7 @@ class SimpleAgentGUI:
         self.loading_frames = ["", ".", "..", "..."]
         self.loading_index = 0
         self.min_response_tokens = 256
-        self.default_response_tokens = 32768
+        self.default_response_tokens = 16384
         self.max_response_tokens = 131072
         self.unlimited_response_tokens = 0
         self.selected_response_tokens = self.default_response_tokens
@@ -126,6 +129,7 @@ class SimpleAgentGUI:
         self.console_backlog: list[str] = []
         self.pending_attachments: list[dict[str, str]] = []
         self.pending_knowledge_files: list[dict[str, Any]] = []
+        self.current_chat_directive: str = ""
         self.knowledge_embedding_model: Any | None = None
         self.knowledge_chunk_cache: dict[str, dict[str, Any]] = {}
         self.loaded_mlx_models: dict[str, tuple[Any, Any]] = {}
@@ -252,6 +256,8 @@ class SimpleAgentGUI:
         file_menu.add_command(label="Download Models", command=self._download_text_models_async)
         file_menu.add_separator()
         file_menu.add_command(label="Clear Temp Attachments", command=self._clear_temp_attachments)
+        file_menu.add_separator()
+        file_menu.add_command(label="Open Current Chat Folder", command=self._open_current_chat_folder)
         file_menu.add_separator()
         file_menu.add_command(label="Quit", command=self.root.destroy)
 
@@ -490,7 +496,7 @@ class SimpleAgentGUI:
             widget.insert(tk.END, "\n".join(code_lines).rstrip() + "\n", "code")
 
     def _insert_inline_markdown_to_widget(self, widget: tk.Text, text: str, base_tag: str) -> None:
-        pattern = r"($begin:math:display$\[\^$end:math:display$]+\]$begin:math:text$https\?\:\/\/\[\^\\s\)\]\+$end:math:text$|https?://[^\s)]+|\*\*\*[^*]+\*\*\*|\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)"
+        pattern = r"(\[[^\]]+\]\(https?://[^\s)]+\)|https?://[^\s)]+|\*\*\*[^*]+\*\*\*|\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)"
         last_index = 0
 
         for match in re.finditer(pattern, text):
@@ -738,6 +744,14 @@ class SimpleAgentGUI:
             width=8,
         )
         self.knowledge_button.grid(row=1, column=1, sticky="e", padx=(8, 0), pady=(4, 0))
+
+        self.directive_button = ttk.Button(
+            self.token_selector_frame,
+            text="Directive",
+            command=self._show_directive_window,
+            width=8,
+        )
+        self.directive_button.grid(row=1, column=2, sticky="e", padx=(8, 0), pady=(4, 0))
 
         self.transcript = tk.Text(
             self.main,
@@ -1282,23 +1296,42 @@ class SimpleAgentGUI:
 
     def _load_chats(self) -> None:
         self.state.chats = []
-        for path in sorted(self.chats_dir.glob("*.txt")):
+
+        if zstd is None:
+            messagebox.showerror(
+                "Missing Dependency",
+                "zstandard is required for compressed chat storage.\n\nRun:\npython -m pip install zstandard",
+            )
+            return
+
+        for chat_folder in sorted(self.chats_dir.iterdir()):
+            if not chat_folder.is_dir():
+                continue
+
+            payload_path = chat_folder / self.chat_payload_filename
+            if not payload_path.exists():
+                continue
+
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
+                data = self._read_chat_file(payload_path)
+            except Exception as exc:
+                self._log("WARN", f"Could not load chat folder {chat_folder.name}: {exc}")
                 continue
 
             if not isinstance(data, dict):
                 continue
 
-            data.setdefault("id", path.stem)
+            data.setdefault("id", chat_folder.name.split("__", 1)[0])
             data.setdefault("title", "New Chat")
             data.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
             data.setdefault("updated_at", data["created_at"])
             data.setdefault("messages", [])
             data.setdefault("memory", [])
             data.setdefault("knowledge_files", [])
-            data["file_path"] = str(path)
+            data.setdefault("directive", "")
+            data["folder_path"] = str(chat_folder)
+            data["file_path"] = str(payload_path)
+            self._ensure_chat_workspace_folder(data)
             self.state.chats.append(data)
 
         self.state.chats.sort(
@@ -1311,9 +1344,8 @@ class SimpleAgentGUI:
             self.state.current_chat_id = self.state.chats[0]["id"]
             return
         chat = self._build_new_chat_payload()
-        self._save_chat(chat)
-        self._set_status(f"Knowledge files saved: {len(chat.get('knowledge_files', []))}")
         self.state.chats.append(chat)
+        self._save_chat(chat)
         self.state.current_chat_id = chat["id"]
 
     def _build_new_chat_payload(self) -> dict[str, Any]:
@@ -1327,26 +1359,81 @@ class SimpleAgentGUI:
             "messages": [],
             "memory": [],
             "knowledge_files": [],
+            "directive": "",
+            "folder_path": "",
+            "file_path": "",
         }
 
     def _slugify_title(self, title: str) -> str:
         slug = re.sub(r"[^a-zA-Z0-9]+", "-", title.lower()).strip("-")
         return slug or "chat"
 
-    def _chat_filename(self, chat: dict[str, Any]) -> str:
-        return f"{chat['id']}__{self._slugify_title(chat['title'])}.txt"
+    def _chat_folder_name(self, chat: dict[str, Any]) -> str:
+        return f"{chat['id']}__{self._slugify_title(chat.get('title', 'New Chat'))}"
+
+    def _chat_folder_path(self, chat: dict[str, Any]) -> Path:
+        return self.chats_dir / self._chat_folder_name(chat)
+
+    def _chat_payload_path(self, chat: dict[str, Any]) -> Path:
+        return self._chat_folder_path(chat) / self.chat_payload_filename
+
+    def _chat_workspace_path(self, chat: dict[str, Any]) -> Path:
+        return self._chat_folder_path(chat)
 
     def _save_chat(self, chat: dict[str, Any]) -> None:
+        if zstd is None:
+            raise RuntimeError("zstandard is required. Run: python -m pip install zstandard")
+
         chat["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        current_path_value = chat.get("file_path")
-        current_path = Path(current_path_value) if current_path_value else None
-        target_path = self.chats_dir / self._chat_filename(chat)
+        current_folder_value = chat.get("folder_path")
+        current_folder = Path(current_folder_value) if current_folder_value else None
+        target_folder = self._chat_folder_path(chat)
 
-        if current_path and current_path.exists() and current_path != target_path:
-            current_path.rename(target_path)
+        if current_folder and current_folder.exists() and current_folder != target_folder:
+            if target_folder.exists():
+                shutil.rmtree(target_folder)
+            current_folder.rename(target_folder)
 
-        chat["file_path"] = str(target_path)
-        target_path.write_text(json.dumps(chat, indent=2, ensure_ascii=False), encoding="utf-8")
+        target_folder.mkdir(parents=True, exist_ok=True)
+        payload_path = target_folder / self.chat_payload_filename
+        chat["folder_path"] = str(target_folder)
+        chat["file_path"] = str(payload_path)
+        self._write_chat_file(payload_path, chat)
+
+    def _read_chat_file(self, path: Path) -> dict[str, Any]:
+        if zstd is None:
+            raise RuntimeError("zstandard is required. Run: python -m pip install zstandard")
+
+        compressed = path.read_bytes()
+        raw = zstd.ZstdDecompressor().decompress(compressed)
+        return json.loads(raw.decode("utf-8"))
+
+    def _write_chat_file(self, path: Path, chat: dict[str, Any]) -> None:
+        if zstd is None:
+            raise RuntimeError("zstandard is required. Run: python -m pip install zstandard")
+
+        serialisable_chat = dict(chat)
+        raw = json.dumps(serialisable_chat, ensure_ascii=False, indent=None).encode("utf-8")
+        compressed = zstd.ZstdCompressor(level=self.chat_compression_level).compress(raw)
+        path.write_bytes(compressed)
+
+    def _ensure_chat_workspace_folder(self, chat: dict[str, Any]) -> Path:
+        folder_value = chat.get("folder_path")
+        folder = Path(folder_value) if folder_value else self._chat_folder_path(chat)
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def _open_current_chat_folder(self) -> None:
+        chat = self._get_current_chat()
+        if chat is None:
+            return
+
+        self._save_chat(chat)
+        folder = Path(chat.get("folder_path", ""))
+        if not folder.exists():
+            folder.mkdir(parents=True, exist_ok=True)
+
+        webbrowser.open(folder.resolve().as_uri())
 
     def _refresh_chat_list(self) -> None:
         self.state.chats.sort(
@@ -1398,6 +1485,7 @@ class SimpleAgentGUI:
         self._update_chat_header(chat)
         self._render_transcript(chat)
         self._load_knowledge_files_from_chat()
+        self._load_directive_from_chat()
 
     def _update_chat_header(self, chat: dict[str, Any]) -> None:
         self.chat_title_label.config(text=chat.get("title", "New Chat"))
@@ -1407,6 +1495,7 @@ class SimpleAgentGUI:
             text=(
                 f"{message_count} messages • "
                 f"{memory_count}/{self.max_memory_items} short-term memory items • "
+                f"Directive: {'on' if str(chat.get('directive', '')).strip() else 'off'} • "
                 f"Model: {self.active_prompt_model_key} • "
                 f"Tokens: {self._response_token_label()}"
             )
@@ -1794,8 +1883,8 @@ class SimpleAgentGUI:
             return
 
         chat = self._build_new_chat_payload()
-        self._save_chat(chat)
         self.state.chats.insert(0, chat)
+        self._save_chat(chat)
         self.state.current_chat_id = chat["id"]
         self._refresh_chat_list()
         self._open_current_chat()
@@ -1823,22 +1912,22 @@ class SimpleAgentGUI:
         if not confirmed:
             return
 
-        file_path_value = chat.get("file_path")
-        if file_path_value:
-            file_path = Path(file_path_value)
-            if file_path.exists():
+        folder_path_value = chat.get("folder_path")
+        if folder_path_value:
+            folder_path = Path(folder_path_value)
+            if folder_path.exists():
                 try:
-                    file_path.unlink()
+                    shutil.rmtree(folder_path)
                 except Exception as exc:
-                    messagebox.showerror("Delete Failed", f"Could not delete the chat file.\n\n{exc}")
+                    messagebox.showerror("Delete Failed", f"Could not delete the chat folder.\n\n{exc}")
                     return
 
         self.state.chats = [c for c in self.state.chats if c.get("id") != chat.get("id")]
 
         if not self.state.chats:
             new_chat = self._build_new_chat_payload()
-            self._save_chat(new_chat)
             self.state.chats.append(new_chat)
+            self._save_chat(new_chat)
             self.state.current_chat_id = new_chat["id"]
         else:
             self.state.current_chat_id = self.state.chats[0]["id"]
@@ -1903,6 +1992,109 @@ class SimpleAgentGUI:
             if item.get("path")
         ]
         self._save_chat(chat)
+        self._ensure_chat_workspace_folder(chat)
+
+    def _load_directive_from_chat(self) -> None:
+        chat = self._get_current_chat()
+        if chat is None:
+            self.current_chat_directive = ""
+            return
+
+        directive = chat.get("directive", "")
+        self.current_chat_directive = str(directive).strip() if directive is not None else ""
+
+    def _save_directive_to_chat(self, directive: str) -> None:
+        chat = self._get_current_chat()
+        if chat is None:
+            return
+
+        cleaned_directive = directive.strip()
+        chat["directive"] = cleaned_directive
+        self.current_chat_directive = cleaned_directive
+        self._save_chat(chat)
+        self._update_chat_header(chat)
+
+        status = "Directive saved." if cleaned_directive else "Directive cleared."
+        self._set_status(status)
+
+    def _show_directive_window(self) -> None:
+        if hasattr(self, "directive_window") and self.directive_window.winfo_exists():
+            self.directive_window.lift()
+            self.directive_window.focus_force()
+            return
+
+        chat = self._get_current_chat()
+        if chat is None:
+            return
+
+        self._load_directive_from_chat()
+
+        root_bg = self.root.cget("bg") or "#202123"
+        self.directive_window = tk.Toplevel(self.root)
+        self.directive_window.title("Chat Directive")
+        self.directive_window.geometry("620x420")
+        self.directive_window.configure(bg=root_bg)
+
+        container = ttk.Frame(self.directive_window, padding=12, style="Main.TFrame")
+        container.pack(fill="both", expand=True)
+
+        title = ttk.Label(container, text="Chat Directive", style="Heading.TLabel")
+        title.pack(anchor="w")
+
+        description = ttk.Label(
+            container,
+            text="These instructions are saved with this chat and inserted into every prompt in this chat.",
+            style="Meta.TLabel",
+            wraplength=560,
+        )
+        description.pack(anchor="w", pady=(4, 10))
+
+        text_frame = ttk.Frame(container, style="Main.TFrame")
+        text_frame.pack(fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(text_frame, orient="vertical")
+        scrollbar.pack(side="right", fill="y")
+
+        self.directive_text = tk.Text(
+            text_frame,
+            wrap="word",
+            bg=root_bg,
+            fg="#e7eee8",
+            insertbackground="#e7eee8",
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=12,
+            height=10,
+            font=("Aptos", 13),
+            yscrollcommand=scrollbar.set,
+        )
+        self.directive_text.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=self.directive_text.yview)
+        self.directive_text.insert("1.0", self.current_chat_directive)
+
+        footer = ttk.Frame(container, style="Main.TFrame")
+        footer.pack(fill="x", pady=(10, 0))
+
+        clear_button = ttk.Button(footer, text="Clear", command=self._clear_directive_text)
+        clear_button.pack(side="left")
+
+        save_button = ttk.Button(footer, text="Save", command=self._save_directive_from_window)
+        save_button.pack(side="right")
+
+        close_button = ttk.Button(footer, text="Close", command=self.directive_window.destroy)
+        close_button.pack(side="right", padx=(0, 8))
+
+    def _clear_directive_text(self) -> None:
+        if hasattr(self, "directive_text"):
+            self.directive_text.delete("1.0", tk.END)
+
+    def _save_directive_from_window(self) -> None:
+        if not hasattr(self, "directive_text"):
+            return
+
+        directive = self.directive_text.get("1.0", tk.END).strip()
+        self._save_directive_to_chat(directive)
 
     def _show_knowledge_window(self) -> None:
         if hasattr(self, "knowledge_window") and self.knowledge_window.winfo_exists():
@@ -2274,19 +2466,17 @@ class SimpleAgentGUI:
 
         observation_source_text = "\n\n".join(observation_source_parts)
         observation_prompt = (
-            "You are the observation step of a lightweight agent loop.\n"
-            "The agent already acted by running tools. Your job is to inspect the tool output and produce a compact observation summary for the final answer.\n\n"
+            "You are SimpleAgent's OBSERVE step. Compress tool/attachment/knowledge context for the final answer.\n"
+            "Return only useful observations, not a full answer.\n\n"
             "Rules:\n"
-            "- Focus only on information relevant to the original user prompt.\n"
-            "- Preserve source URLs, dates, names, numbers, rankings, and concrete facts.\n"
-            "- Prefer reputable or primary sources when the tool output includes source quality information.\n"
-            "- Flag weak, suspicious, incomplete, or undated sources instead of treating them as verified.\n"
-            "- If the tool output is insufficient, say exactly what is missing.\n"
-            "- Do not answer the user fully. Return only observations that will help the final response.\n"
-            "- For resumes, documents, or code reviews, extract strengths, weaknesses, missing details, and specific improvement opportunities.\n"
-            "- Use concise bullets or a compact table when useful.\n\n"
-            f"Original user prompt:\n{prompt}\n\n"
-            "Context output to observe:\n"
+            "- Keep facts relevant to the original prompt; preserve source URLs, dates, names, numbers, filenames, errors, and limits.\n"
+            "- Prefer primary/reputable sources when source quality is shown; flag weak, stale, incomplete, or suspicious context.\n"
+            "- For resumes/docs/code: extract strengths, weaknesses, missing details, exact files/functions, and specific improvements.\n"
+            "- Check dates against the current date. Future-dated means after the current date; ended ranges are completed/historical.\n"
+            "- Be compact: bullets or a small table only.\n\n"
+            f"{self._build_datetime_context()}\n"
+            f"Original prompt:\n{prompt}\n\n"
+            "Context to observe:\n"
             f"{observation_source_text}\n"
         )
         env = os.environ.copy()
@@ -2298,7 +2488,7 @@ class SimpleAgentGUI:
             observation = self._generate_text_with_budget(
                 local_model_path=local_model_path,
                 prompt=observation_prompt,
-                max_tokens=4096,
+                max_tokens=self.default_response_tokens,
                 env=env,
                 show_thinking=False,
             )
@@ -2338,8 +2528,8 @@ class SimpleAgentGUI:
 
         code_related_messages.reverse()
         lines = [
-            "Recent code conversation context:",
-            "Use this only to preserve continuity for ongoing code edits. Attached code files remain the source of truth.",
+            "Recent code context:",
+            "Use only for continuity; attached code files remain source of truth.",
         ]
         for index, message in enumerate(code_related_messages, start=1):
             role = message.get("role", "unknown")
@@ -2407,22 +2597,20 @@ class SimpleAgentGUI:
     def _build_agent_identity_context(self) -> str:
         return (
             "SimpleAgent context:\n"
-            "- You are SimpleAgent, a local-first AI agent running on the user's Mac. The base model may be Qwen, but speak as SimpleAgent unless asked about the model.\n"
-            "- Available context may include memory, persistent knowledge files, skill results, web/search output, URLs, attachments, PDF text, vision analysis, code files, and recent code conversation history. Treat provided context as grounding.\n"
-            "- Answer the user's actual request directly. Do not merely summarise tool output. Do not expose internal planning or agent-loop steps unless asked.\n"
-            "- Be factual: do not invent details beyond provided context; if context is missing, failed, weak, truncated, or uncertain, say so clearly.\n"
-            "- Prefer practical output: tables for comparisons/multiple items, concise bullets for actions, and patch-style snippets for code changes.\n"
-            "- For coding, attached code files are the source of truth; use recent code context only for continuity across follow-ups. Do not claim edits were applied unless the app actually edited files.\n"
-            "- For file analysis, name the file used and mention truncation or extraction limits when relevant.\n"
+            "- You are SimpleAgent, a local-first AI agent on the user's Mac. Speak as SimpleAgent unless asked about the base model.\n"
+            "- Ground answers in available memory, knowledge files, skill results, web/URL output, attachments, PDF text, vision analysis, code files, and recent code context.\n"
+            "- Answer the actual request directly; do not merely summarise context or expose internal planning unless asked.\n"
+            "- Do not invent missing details. If context is weak, failed, truncated, stale, or uncertain, say so briefly.\n"
+            "- Prefer practical output: tables for multi-item answers, concise bullets for actions, and exact patch-style snippets for code.\n"
+            "- For coding, attached code is source of truth; recent code context is only for continuity. Do not claim edits were applied unless the app actually edited files.\n"
         )
 
     def _build_datetime_context(self) -> str:
         now = datetime.now().astimezone()
         return (
-            "Current date/time context:\n"
-            f"- Local date and time: {now.strftime('%A, %d %B %Y, %H:%M:%S %Z')}\n"
-            f"- ISO timestamp: {now.isoformat(timespec='seconds')}\n"
-            "Strictly use this as today's date/time when interpreting relative dates like today, tomorrow, yesterday, this week, this month, or this year."
+            "Current date/time:\n"
+            f"- {now.strftime('%A, %d %B %Y')}, {now.strftime('%H:%M:%S %z')} ({now.isoformat(timespec='seconds')}).\n"
+            "- Use this for dates, deadlines, timelines, news, resumes, and certifications. Future-dated means after this date; ranges ending before this date are completed/historical.\n"
         )
 
     def _build_attachment_context(self, prompt: str, attachments: list[dict[str, str]]) -> str:
@@ -2653,6 +2841,37 @@ class SimpleAgentGUI:
         cleaned_output = self._remove_hidden_prompt_thinking_leak(cleaned_output)
         return cleaned_output.strip()
 
+    def _should_use_fast_final_response(
+            self,
+            prompt: str,
+            skill_ids: list[int],
+            attachments: list[dict[str, Any]],
+            knowledge_context: str,
+            directive_context: str,
+    ) -> bool:
+        if attachments or knowledge_context:
+            return False
+        if any(skill_id != 0 for skill_id in skill_ids):
+            return False
+
+        prompt_lower = prompt.strip().lower()
+        if not prompt_lower:
+            return False
+
+        complex_markers = {
+            "analyse", "analyze", "compare", "evaluate", "debug", "fix", "refactor",
+            "implement", "research", "search", "explain deeply", "step by step", "plan",
+            "strategy", "architecture", "code", "pdf", "resume", "investment",
+        }
+        if any(marker in prompt_lower for marker in complex_markers):
+            return False
+
+        simple_markers = {
+            "hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "lol", "haha",
+            "who are you", "what can you do", "nice", "cool",
+        }
+        return len(prompt_lower) <= 120 or prompt_lower in simple_markers
+
     def _run_prompt(
         self,
         prompt: str,
@@ -2675,6 +2894,7 @@ class SimpleAgentGUI:
             raise RuntimeError("Prompt model is not downloaded locally yet. Use the download button first.")
 
         self.root.after(0, lambda: self._set_loading_base("Preparing context"))
+        directive_context = self._build_directive_context()
         memory_block = self._build_memory_block(memory_items)
 
         self.root.after(0, lambda: self._set_loading_base("Retrieving knowledge"))
@@ -2705,15 +2925,17 @@ class SimpleAgentGUI:
             self._build_agent_identity_context(),
             self._build_datetime_context(),
         ]
+        if directive_context:
+            prompt_parts.append(directive_context)
         if memory_block:
             prompt_parts.append(memory_block)
 
         if knowledge_context:
             prompt_parts.append(knowledge_context)
             prompt_parts.append(
-                "Knowledge retrieval rules:\n"
-                "- Use persistent knowledge files only when relevant to the current prompt.\n"
-                "- Knowledge files are background context, not normal chat attachments.\n"
+                "Knowledge rules:\n"
+                "- Use persistent knowledge only when relevant. Mention missing/unreadable/stale files only if they affect the answer.\n"
+                "- Compare dates in knowledge files against the current date/time context."
             )
 
         if 7 in skill_ids:
@@ -2745,12 +2967,11 @@ class SimpleAgentGUI:
 
         if attachment_context:
             prompt_parts.append(
-                "Attachment result rules:\n"
-                "- Use the attachment analysis as grounding context.\n"
-                "- If an attached file was marked path only, acknowledge that it was attached but not automatically analysed yet.\n"
-                "- If attached content was truncated, mention that your answer is based only on the available extracted content.\n"
-                "- For resumes, documents, or code reviews, provide a direct evaluation, a score when requested, strengths, weaknesses, and specific improvements.\n"
-                "- Do not claim to see an image, read a PDF, or inspect a file if the relevant attachment analysis failed."
+                "Code rules:\n"
+                "- Attached code files are source of truth; recent code context is for follow-up continuity.\n"
+                "- Resolve 'this/that/it/try again/fix it/continue' from recent code context and attachments.\n"
+                "- Identify relevant files/functions/classes, then give exact patch-style snippets.\n"
+                "- If multiple files are involved, label each change by file. Do not claim edits were applied unless the app edited files."
             )
 
         if 7 in skill_ids:
@@ -2768,15 +2989,22 @@ class SimpleAgentGUI:
 
         if agent_loop_plan or observation_context:
             prompt_parts.append(
-                "Agent loop response rules:\n"
-                "- Use the plan and observations to improve answer quality.\n"
-                "- Do not expose the internal loop unless the user asks for it.\n"
-                "- If the observation summary and raw context conflict, prefer the raw context and mention uncertainty.\n"
-                "- Give the final answer in the most useful format for the user's request."
+                "Agent response rules:\n"
+                "- Use plan/observations to improve quality, but do not expose the loop unless asked.\n"
+                "- If observations conflict with raw context, prefer raw context and mention uncertainty.\n"
+                "- Verify date claims against current date/time. Answer in the most useful format."
             )
 
         prompt_parts.append(f"Current user prompt:\n{prompt}")
-        final_prompt = "\n\n".join(prompt_parts)
+        if self._should_use_fast_final_response(
+                prompt=prompt,
+                skill_ids=skill_ids,
+                attachments=attachments,
+                knowledge_context=knowledge_context,
+                directive_context=directive_context,
+        ):
+            prompt_parts.append(self._build_fast_response_instruction())
+        final_prompt = "\n\n".join(part for part in prompt_parts if part)
         response_token_budget = self.selected_response_tokens
         if response_token_budget != self.unlimited_response_tokens:
             response_token_budget = self._clamp_response_tokens(response_token_budget)
@@ -2876,11 +3104,17 @@ class SimpleAgentGUI:
 
     def _build_no_think_prompt(self, prompt: str) -> str:
         return (
-            f"{prompt.strip()}\n\n"
-            "System instruction for this internal helper call:\n"
-            "Do not output reasoning, analysis, planning notes, or <think> tags. "
-            "Return only the final requested value.\n"
-            "/no_think"
+            "/no_think\n"
+            "Answer directly. Do not include reasoning, analysis, planning notes, or <think> tags.\n"
+            "Return only the requested output.\n\n"
+            f"{prompt.strip()}"
+        )
+
+    def _build_fast_response_instruction(self) -> str:
+        return (
+            "Response mode:\n"
+            "/no_think\n"
+            "Answer directly and briefly. Do not include reasoning, planning notes, or <think> tags."
         )
 
     def _remove_hidden_prompt_thinking_leak(self, text: str) -> str:
@@ -3707,9 +3941,8 @@ class SimpleAgentGUI:
 
         if selected_chunks:
             lines = [
-                "Persistent knowledge retrieval context for this chat:",
-                "The following chunks were selected from persistent knowledge files using local embedding retrieval with rag-all-minilm-l6-v2 when available.",
-                "Use these as background knowledge only when relevant to the current prompt.",
+                "Persistent knowledge retrieval context:",
+                "Relevant chunks selected with local embeddings when available. Use only if relevant.",
             ]
 
             for index, chunk in enumerate(selected_chunks, start=1):
@@ -3736,11 +3969,25 @@ class SimpleAgentGUI:
             return "\n".join(lines)
 
         return (
-                "Persistent knowledge retrieval context for this chat:\n"
-                "Embedding retrieval was unavailable, so SimpleAgent used capped file previews instead.\n"
-                "Use this as background knowledge only when relevant to the current prompt.\n"
-                "If a listed knowledge file is missing, mention that it could not be loaded when relevant.\n\n"
+                "Persistent knowledge retrieval context:\n"
+                "Embedding retrieval unavailable; using capped previews. Use only if relevant. Mention missing files only if they affect the answer.\n\n"
                 + "\n\n".join(fallback_parts)
+        )
+
+    def _build_directive_context(self) -> str:
+        chat = self._get_current_chat()
+        if chat is None:
+            return ""
+
+        directive = str(chat.get("directive", "") or "").strip()
+        if not directive:
+            return ""
+
+        return (
+            "Chat directive:\n"
+            "The following user-defined directive applies to every prompt in this chat. "
+            "Follow it unless it conflicts with higher-priority system/safety rules or the current user request.\n"
+            f"{directive}"
         )
 
     def _build_memory_block(self, memory_items: list[dict[str, str]]) -> str:
@@ -3788,11 +4035,9 @@ class SimpleAgentGUI:
             return "", ""
 
         memory_prompt = (
-            "Create compact memory summaries for one conversation turn.\n"
-            "Return exactly two lines and nothing else.\n"
-            "Line 1 must start with `user_summary:` and contain one short sentence summarising the user's durable intent, key constraints, and important facts.\n"
-            "Line 2 must start with `assistant_summary:` and contain one short sentence summarising only the assistant's main outcome, decision, or useful result.\n"
-            "Do not include reasoning, analysis, markdown, bullets, JSON, or <think> tags.\n\n"
+            "Summarise one chat turn for memory. Output exactly two lines, no markdown, no reasoning.\n"
+            "user_summary: one short sentence with the user's durable intent, constraints, and important facts.\n"
+            "assistant_summary: one short sentence with the assistant's main outcome or useful result.\n\n"
             f"User prompt:\n{user_prompt}\n\n"
             f"Assistant response:\n{model_response}"
         )
@@ -3805,7 +4050,7 @@ class SimpleAgentGUI:
             visible_response = self._generate_text_with_budget(
                 local_model_path=local_model_path,
                 prompt=memory_prompt,
-                max_tokens=256,
+                max_tokens=512,
                 env=env,
                 show_thinking=False,
             )

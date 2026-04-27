@@ -6,7 +6,7 @@
 
 SimpleAgent is a local-first desktop AI agent built for Apple Silicon.
 
-It runs small local models with MLX and gives them a practical agent system around them: memory, skill routing, an agent loop, persistent knowledge retrieval, file attachments, web search, URL scraping, vision analysis, text-file reading, PDF reading, code-file reading, and a simple GUI.
+It runs small local models with MLX and gives them a practical agent system around them: memory, chat directives, compressed per-chat workspaces, skill routing, an agent loop, persistent knowledge retrieval, file attachments, web search, URL scraping, vision analysis, text-file reading, PDF reading, code-file reading, and a simple GUI.
 
 The goal is simple:
 
@@ -27,7 +27,9 @@ It can:
 - search the web when needed
 - scrape user-provided URLs
 - remember recent conversation summaries
+- save chat-specific directives that are injected into every prompt in that chat
 - use persistent per-chat knowledge retrieval with local embeddings
+- store each chat inside its own compressed workspace folder
 - use a lightweight agent loop to plan, act, observe, and answer
 - read attached text and config files
 - read attached PDF files
@@ -102,6 +104,31 @@ This helps the model understand phrases like:
 - this year
 - latest
 - current
+
+---
+
+### Chat Directives
+
+Each chat can have its own persistent directive.
+
+The `Directive` button near the response token selector opens a popup where you can write instructions that apply to every prompt in the current chat.
+
+This is useful for setting an underlying mission or style for a chat, such as:
+
+- keep answers short
+- focus on coding edits
+- act as a project planning assistant
+- use a specific writing style
+- treat this chat as a research workspace
+
+Directives are saved inside the compressed chat payload and are reloaded when the chat is opened again.
+
+Directive rules:
+
+- directives apply only to the current chat
+- directives are injected before memory, knowledge, skills, and attachments
+- directives should guide behaviour without overriding higher-priority system or safety rules
+- the chat header shows whether the directive is on or off
 
 ---
 
@@ -290,7 +317,7 @@ The current knowledge retrieval flow is:
 ```text
 Add knowledge files to chat
 ↓
-Save file paths into the chat file
+Save file paths into the compressed chat payload
 ↓
 Read supported knowledge files locally
 ↓
@@ -609,6 +636,8 @@ Hidden helper prompts are kept as small as possible. Memory summarisation now co
 
 Knowledge retrieval also reduces prompt size by selecting relevant chunks from persistent files instead of always passing full file contents.
 
+Chat directives provide another lightweight control layer by letting each chat carry a persistent instruction without repeatedly typing it into every prompt.
+
 ---
 
 ## Model Setup
@@ -657,7 +686,7 @@ pip install mlx-lm
 Recommended:
 
 ```bash
-pip install sentence-transformers huggingface-hub
+pip install sentence-transformers huggingface-hub zstandard
 ```
 
 For vision attachments:
@@ -707,7 +736,7 @@ source .venv/bin/activate
 
 ```bash
 pip install -U pip
-pip install mlx-lm mlx-vlm sentence-transformers huggingface-hub pillow tkinterdnd2 torch torchvision pypdf
+pip install mlx-lm mlx-vlm sentence-transformers huggingface-hub pillow tkinterdnd2 torch torchvision pypdf zstandard
 ```
 
 Optional for webpage scraping:
@@ -745,10 +774,14 @@ SimpleAgent stores local data in these folders:
 
 | Folder | Purpose |
 |---|---|
-| `chats/` | Saved chat files |
+| `chats/<chat-id>__<slug>/` | Per-chat workspace folder for the compressed chat payload, future agent-created files, and chat-specific artifacts |
+| `chats/<chat-id>__<slug>/chat.json.zst` | Compressed saved chat payload using Zstandard |
 | `models/` | Downloaded local models |
 | `temp_attachments/` | Pasted clipboard images and temporary attachments |
-| `chats/` knowledge file paths | Persistent per-chat knowledge file references are saved inside each chat file |
+
+Each chat is stored inside its own folder. The chat payload is compressed with Zstandard as `chat.json.zst`, and the same chat folder also acts as the workspace for future agent-created files and chat-specific artifacts.
+
+The compressed chat payload stores the chat messages, memory summaries, directive, knowledge file paths, and chat metadata. Knowledge files themselves remain referenced by path unless copied or created inside the chat workspace later.
 
 Recommended `.gitignore` entries:
 
@@ -774,6 +807,8 @@ Prepare SimpleAgent identity context
 ↓
 Prepare date/time context
 ↓
+Prepare chat directive context
+↓
 Prepare recent memory context
 ↓
 Retrieve relevant persistent knowledge chunks
@@ -792,11 +827,11 @@ Build final prompt
 ↓
 Generate answer with local model
 ↓
-Save assistant response
+Save assistant response into compressed chat payload
 ↓
 Summarise user and assistant turn into memory in one pass
 ↓
-Update GUI
+Update compressed chat workspace and GUI
 ```
 
 This structure lets a small model behave more like an agent.
@@ -823,13 +858,17 @@ File extensions, URLs, and obvious tool triggers should be handled by code, not 
 
 Persistent knowledge files are searched with embeddings so the model receives the most relevant chunks instead of unnecessary full-file context.
 
-### 5. Make everything visible
+### 5. One chat, one workspace
+
+Each chat has its own folder. This keeps the compressed chat history, future generated files, and chat-specific artifacts together in one place.
+
+### 6. Make everything visible
 
 The console window shows what the agent is doing internally.
 
 This makes debugging much easier.
 
-### 6. Keep it hackable
+### 7. Keep it hackable
 
 The project is intentionally simple enough to modify and extend.
 
@@ -850,6 +889,10 @@ Known limitations:
 - PDF reading works best for PDFs with extractable text; scanned PDFs may need image conversion or vision analysis.
 - Persistent knowledge retrieval currently stores file paths, so moving or deleting a knowledge file will mark it as missing.
 - Knowledge retrieval currently uses local chunk similarity; a dedicated reranker is not yet included.
+- Compressed chat storage requires the `zstandard` Python package.
+- Old plain-text chat files are not part of the current compressed chat-folder design.
+- Chat directives are powerful but should be kept concise; very long directives increase prompt size.
+
 - DOCX, XLSX, and PPTX files are not deeply parsed yet unless converted or handled through future skills.
 
 ---
