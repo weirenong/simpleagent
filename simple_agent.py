@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -19,6 +22,9 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 import skills
+from pypdf import PdfReader
+
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 try:
     from PIL import Image, ImageGrab
@@ -123,26 +129,42 @@ class SimpleAgentGUI:
         self.video_attachment_extensions = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
         self.vl_supported_extensions = self.image_attachment_extensions | self.video_attachment_extensions
         self.text_attachment_extensions = {
-            ".txt", ".md", ".markdown", ".rst", ".log", ".csv", ".tsv",
-            ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env",
-            ".xml", ".html", ".htm", ".css", ".scss", ".sass", ".less",
-            ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
-            ".py", ".pyw", ".ipynb", ".sql", ".sh", ".bash", ".zsh", ".fish",
-            ".bat", ".ps1", ".java", ".kt", ".kts", ".c", ".h", ".cpp", ".hpp", ".cc", ".cs",
-            ".go", ".rs", ".swift", ".php", ".rb", ".lua", ".r", ".m", ".scala", ".dart",
-            ".vue", ".svelte", ".astro", ".tex", ".bib", ".gitignore", ".dockerignore",
+            ".txt", ".md", ".markdown", ".rst", ".log",
+            ".csv", ".tsv",
+            ".json", ".jsonl",
+            ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env",
+            ".xml",
+            ".tex", ".bib",
+            ".gitignore", ".dockerignore",
             ".editorconfig", ".requirements", ".lock",
+        }
+        self.pdf_attachment_extensions = {".pdf"}
+        self.code_attachment_extensions = {
+            ".py", ".pyw", ".ipynb", ".sql",
+            ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+            ".html", ".htm", ".css", ".scss", ".sass", ".less",
+            ".sh", ".bash", ".zsh", ".fish",
+            ".bat", ".ps1",
+            ".java", ".kt", ".kts",
+            ".c", ".h", ".cpp", ".hpp", ".cc", ".cs",
+            ".go", ".rs", ".swift", ".php", ".rb", ".lua", ".r", ".m",
+            ".scala", ".dart",
+            ".vue", ".svelte", ".astro",
         }
 
         self.attachment_skill_map: dict[str, int] = {
             **{extension: 4 for extension in self.image_attachment_extensions},
             **{extension: 4 for extension in self.video_attachment_extensions},
             **{extension: 5 for extension in self.text_attachment_extensions},
+            **{extension: 6 for extension in self.pdf_attachment_extensions},
+            **{extension: 7 for extension in self.code_attachment_extensions},
         }
 
         self.attachment_handler_map: dict[int, str] = {
             4: "attachment_vision",
             5: "text_file_reader",
+            6: "pdf_reader",
+            7: "code_reader",
         }
 
         os.environ.setdefault("HF_HOME", str(self.models_dir / ".hf_cache"))
@@ -759,6 +781,12 @@ class SimpleAgentGUI:
 
         if skill_id == 4:
             self._set_status(f"Attached visual file for VL analysis: {path.name}")
+        elif skill_id == 5:
+            self._set_status(f"Attached text file for reading: {path.name}")
+        elif skill_id == 6:
+            self._set_status(f"Attached PDF file for reading: {path.name}")
+        elif skill_id == 7:
+            self._set_status(f"Attached code file for coding analysis: {path.name}")
         else:
             self._set_status(f"Attached file path only: {path.name}")
 
@@ -798,6 +826,10 @@ class SimpleAgentGUI:
                 handler_label = "vision"
             elif skill_id == 5:
                 handler_label = "text"
+            elif skill_id == 6:
+                handler_label = "pdf"
+            elif skill_id == 7:
+                handler_label = "code"
             else:
                 handler_label = "path only"
             pinned = bool(attachment.get("pinned", False))
@@ -1128,7 +1160,7 @@ class SimpleAgentGUI:
         else:
             for message in messages:
                 role = message.get("role", "assistant")
-                name = "You" if role == "user" else "Qwen"
+                name = "You" if role == "user" else "SimpleAgent"
                 tag = "user_name" if role == "user" else "assistant_name"
                 self.transcript.insert(tk.END, f"{name}\n", tag)
                 self._insert_formatted_message(message.get("content", "").strip())
@@ -1150,6 +1182,10 @@ class SimpleAgentGUI:
                 handler_label = "vision"
             elif skill_id == 5:
                 handler_label = "text"
+            elif skill_id == 6:
+                handler_label = "pdf"
+            elif skill_id == 7:
+                handler_label = "code"
             else:
                 handler_label = "path only"
 
@@ -1645,6 +1681,215 @@ class SimpleAgentGUI:
         user_messages = [m for m in chat.get("messages", []) if m.get("role") == "user"]
         return title in {"", "new chat"} and len(user_messages) == 1
 
+    def _build_agent_loop_plan(
+            self,
+            prompt: str,
+            skill_ids: list[int],
+            attachments: list[dict[str, str]],
+    ) -> str:
+        if not skill_ids and not attachments:
+            return ""
+
+        skill_names = {
+            0: "no_skill",
+            1: "internet_search",
+            2: "scrape_url",
+            3: "memory_rag",
+            4: "attachment_vision",
+            5: "text_file_reader",
+            6: "pdf_reader",
+            7: "code_reader",
+        }
+
+        selected_skills = [skill_names.get(skill_id, f"unknown_{skill_id}") for skill_id in skill_ids]
+        attachment_names = [attachment.get("name", "file") for attachment in attachments]
+
+        lines = [
+            "Agent loop plan:",
+            "- Think: identify the user's actual goal and the evidence needed to answer it.",
+        ]
+
+        if selected_skills:
+            lines.append(f"- Act: run selected skills: {', '.join(selected_skills)}.")
+
+        if attachment_names:
+            lines.append(f"- Act: inspect attached files: {', '.join(attachment_names)}.")
+
+        lines.extend(
+            [
+                "- Observe: extract only information that is relevant to the user's prompt.",
+                "- Respond: give the final answer directly; do not narrate this loop unless the user asks how the answer was produced.",
+            ]
+        )
+
+        return "\n".join(lines)
+
+    def _build_agent_observation_summary(
+            self,
+            prompt: str,
+            skill_context: str,
+            attachment_context: str,
+    ) -> str:
+        observation_source_parts: list[str] = []
+        if skill_context:
+            observation_source_parts.append(skill_context)
+        if attachment_context and self._attachment_context_should_be_observed(attachment_context):
+            observation_source_parts.append(attachment_context)
+        if not observation_source_parts:
+            return ""
+
+        model = self._resolve_model(self.active_prompt_model_key)
+        if model is None or model["runtime"] != "mlx-lm":
+            return ""
+
+        model_dir = self.models_dir / model["key"]
+        local_model_path = model_dir / "model"
+        if not local_model_path.exists():
+            return ""
+
+        observation_source_text = "\n\n".join(observation_source_parts)
+        observation_prompt = (
+            "You are the observation step of a lightweight agent loop.\n"
+            "The agent already acted by running tools. Your job is to inspect the tool output and produce a compact observation summary for the final answer.\n\n"
+            "Rules:\n"
+            "- Focus only on information relevant to the original user prompt.\n"
+            "- Preserve source URLs, dates, names, numbers, rankings, and concrete facts.\n"
+            "- Prefer reputable or primary sources when the tool output includes source quality information.\n"
+            "- Flag weak, suspicious, incomplete, or undated sources instead of treating them as verified.\n"
+            "- If the tool output is insufficient, say exactly what is missing.\n"
+            "- Do not answer the user fully. Return only observations that will help the final response.\n"
+            "- For resumes, documents, or code reviews, extract strengths, weaknesses, missing details, and specific improvement opportunities.\n"
+            "- Use concise bullets or a compact table when useful.\n\n"
+            f"Original user prompt:\n{prompt}\n\n"
+            "Context output to observe:\n"
+            f"{observation_source_text}\n"
+        )
+    def _build_code_conversation_context(self, current_prompt: str, max_messages: int = 8) -> str:
+        current_chat = self._get_current_chat()
+        if current_chat is None:
+            return ""
+
+        messages = current_chat.get("messages", [])
+        if not messages:
+            return ""
+
+        code_related_messages: list[dict[str, Any]] = []
+        for message in reversed(messages):
+            role = message.get("role", "")
+            content = str(message.get("content", "")).strip()
+            if not content:
+                continue
+            if role == "user" and content == current_prompt.strip():
+                continue
+            if self._message_is_code_related(message):
+                code_related_messages.append(message)
+            if len(code_related_messages) >= max_messages:
+                break
+
+        if not code_related_messages:
+            return ""
+
+        code_related_messages.reverse()
+        lines = [
+            "Recent code conversation context:",
+            "Use this only to preserve continuity for ongoing code edits. Attached code files remain the source of truth.",
+        ]
+        for index, message in enumerate(code_related_messages, start=1):
+            role = message.get("role", "unknown")
+            content = self._compact_code_context_text(str(message.get("content", "")))
+            if not content:
+                continue
+            lines.append(f"{index}. {role}: {content}")
+            attachments = message.get("attachments", [])
+            if attachments:
+                attachment_bits = []
+                for attachment in attachments:
+                    name = attachment.get("name", "file")
+                    skill_id = attachment.get("skill_id")
+                    handler = attachment.get("handler", "pending")
+                    attachment_bits.append(f"{name} (skill {skill_id}, {handler})")
+                lines.append(f"   Attachments: {', '.join(attachment_bits)}")
+
+        return "\n".join(lines)
+
+    def _message_is_code_related(self, message: dict[str, Any]) -> bool:
+        content = str(message.get("content", "")).lower()
+        attachments = message.get("attachments", [])
+        if any(attachment.get("skill_id") == 7 for attachment in attachments):
+            return True
+
+        code_markers = (
+            "code", "coding", "script", "function", "class", "method", "bug", "debug",
+            "traceback", "refactor", "implement", "implementation", "patch", "edit file",
+            "modify", "fix this", "fix it", "unit test", "pytest", "syntax", "simple_agent.py",
+            "skills.py", "python", "javascript", "typescript", "sql", "tkinter", "pyinstaller",
+        )
+        return any(marker in content for marker in code_markers)
+
+    def _compact_code_context_text(self, text: str, max_chars: int = 900) -> str:
+        cleaned = self._strip_thinking_for_storage(text)
+        cleaned = self._plain_text_compact(cleaned)
+        if len(cleaned) <= max_chars:
+            return cleaned
+        return cleaned[:max_chars].rstrip() + "..."
+
+        env = os.environ.copy()
+        env["HF_HUB_OFFLINE"] = "1"
+        env["TRANSFORMERS_OFFLINE"] = "1"
+
+        try:
+            self.root.after(0, lambda: self._set_loading_base("Observing skill results"))
+            observation = self._generate_text_with_budget(
+                local_model_path=local_model_path,
+                prompt=observation_prompt,
+                max_tokens=4096,
+                env=env,
+                show_thinking=False,
+            )
+        except Exception:
+            return ""
+
+        observation = observation.strip()
+        if not observation:
+            return ""
+
+        return "Agent observations from tool results:\n" + observation
+
+    def _attachment_context_should_be_observed(self, attachment_context: str) -> bool:
+        if not attachment_context:
+            return False
+
+        lowered = attachment_context.lower()
+        important_markers = (
+            "pdf attachment content",
+            "text attachment content",
+            "resume",
+            "cv",
+            "code",
+            "script",
+            "function",
+            "class ",
+            "def ",
+            "error",
+            "traceback",
+        )
+        if any(marker in lowered for marker in important_markers):
+            return True
+
+        return len(attachment_context) > 6000
+
+    def _build_agent_identity_context(self) -> str:
+        return (
+            "SimpleAgent context:\n"
+            "- You are SimpleAgent, a local-first AI agent running on the user's Mac. The base model may be Qwen, but speak as SimpleAgent unless asked about the model.\n"
+            "- Available context may include memory, skill results, web/search output, URLs, attachments, PDF text, vision analysis, code files, and recent code conversation history. Treat provided context as grounding.\n"
+            "- Answer the user's actual request directly. Do not merely summarise tool output. Do not expose internal planning or agent-loop steps unless asked.\n"
+            "- Be factual: do not invent details beyond provided context; if context is missing, failed, weak, truncated, or uncertain, say so clearly.\n"
+            "- Prefer practical output: tables for comparisons/multiple items, concise bullets for actions, and patch-style snippets for code changes.\n"
+            "- For coding, attached code files are the source of truth; use recent code context only for continuity across follow-ups. Do not claim edits were applied unless the app actually edited files.\n"
+            "- For file analysis, name the file used and mention truncation or extraction limits when relevant.\n"
+        )
+
     def _build_datetime_context(self) -> str:
         now = datetime.now().astimezone()
         return (
@@ -1679,6 +1924,18 @@ class SimpleAgentGUI:
                     context_parts.append(f"Text attachment content for {name}:\n{text_result}")
                 else:
                     pending_files.append(f"{name} ({path}) - text file could not be read")
+            elif skill_id == 6 and path:
+                pdf_result = self._read_pdf_attachment(path)
+                if pdf_result:
+                    context_parts.append(f"PDF attachment content for {name}:\n{pdf_result}")
+                else:
+                    pending_files.append(f"{name} ({path}) - PDF could not be read")
+            elif skill_id == 7 and path:
+                code_result = self._read_text_attachment(path)
+                if code_result:
+                    context_parts.append(f"Code attachment content for {name}:\n{code_result}")
+                else:
+                    pending_files.append(f"{name} ({path}) - code file could not be read")
             else:
                 handler = attachment.get("handler", "pending")
                 pending_files.append(
@@ -1739,6 +1996,64 @@ class SimpleAgentGUI:
         footer = "\n--- file content end ---"
         if truncated:
             footer = "\n--- file content truncated because it exceeded the text attachment limit ---" + footer
+
+        return metadata + content + footer
+
+    def _read_pdf_attachment(self, file_path: str, max_chars: int | None = None) -> str:
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            return ""
+
+        try:
+            file_size = path.stat().st_size
+        except Exception:
+            file_size = 0
+
+        pdf_warning_buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(pdf_warning_buffer):
+                reader = PdfReader(str(path), strict=False)
+        except Exception as exc:
+            return f"PDF read failed: {exc}"
+
+        pages: list[str] = []
+        page_count = len(reader.pages)
+
+        for page_index, page in enumerate(reader.pages, start=1):
+            try:
+                with contextlib.redirect_stderr(pdf_warning_buffer):
+                    page_text = page.extract_text() or ""
+            except Exception as exc:
+                page_text = f"[Page {page_index} extraction failed: {exc}]"
+
+            page_text = page_text.strip()
+            if page_text:
+                pages.append(f"--- page {page_index} ---\n{page_text}")
+
+        content = "\n\n".join(pages).strip()
+
+        if not content:
+            return (
+                f"PDF read warning: no extractable text found in {path.name}. "
+                "This PDF may be scanned or image-based. Use the vision attachment skill by converting pages to images."
+            )
+
+        truncated = max_chars is not None and len(content) > max_chars
+        if truncated:
+            content = content[:max_chars]
+
+        metadata = (
+            f"Path: {path}\n"
+            f"Extension: {self._attachment_extension(path)}\n"
+            f"Size bytes: {file_size}\n"
+            f"Page count: {page_count}\n"
+            f"Truncated: {'yes' if truncated else 'no'}\n"
+            "--- pdf content start ---\n"
+        )
+
+        footer = "\n--- pdf content end ---"
+        if truncated:
+            footer = "\n--- pdf content truncated because it exceeded the PDF attachment limit ---" + footer
 
         return metadata + content + footer
 
@@ -1845,11 +2160,29 @@ class SimpleAgentGUI:
         self.root.after(0, lambda: self._set_loading_base("Handling attachments"))
         attachment_context = self._build_attachment_context(prompt, attachments or [])
 
+        self.root.after(0, lambda: self._set_loading_base("Planning response"))
+        agent_loop_plan = self._build_agent_loop_plan(prompt, skill_ids, attachments or [])
+        observation_context = self._build_agent_observation_summary(prompt, skill_context, attachment_context)
+
         self.root.after(0, lambda: self._set_loading_base("Building prompt"))
-        prompt_parts: list[str] = [self._build_datetime_context()]
+        prompt_parts: list[str] = [
+            self._build_agent_identity_context(),
+            self._build_datetime_context(),
+        ]
         if memory_block:
             prompt_parts.append(memory_block)
-        if skill_context:
+
+        if 7 in skill_ids:
+            code_conversation_context = self._build_code_conversation_context(prompt)
+            if code_conversation_context:
+                prompt_parts.append(code_conversation_context)
+
+        if agent_loop_plan:
+            prompt_parts.append(agent_loop_plan)
+
+        if observation_context:
+            prompt_parts.append(observation_context)
+        elif skill_context:
             prompt_parts.append(skill_context)
 
         if attachment_context:
@@ -1857,16 +2190,47 @@ class SimpleAgentGUI:
 
         if skill_context:
             prompt_parts.append(
-                "Use the skill results as grounding context. "
-                "Do not invent facts that are not present in the skill results. "
-                "If the skill results only provide source pages but not the exact requested answer, say that and point the user to the best source URLs."
+                "Skill result rules:\n"
+                "- Use the skill results as grounding context.\n"
+                "- Do not invent facts that are not present in the skill results.\n"
+                "- For web/news/current-event answers, prefer reputable sources and be cautious with unknown domains.\n"
+                "- If dates are missing from the skill results, say that the date was not provided instead of guessing.\n"
+                "- If the skill results only provide source pages but not the exact requested answer, say that and point the user to the best source URLs.\n"
+                "- Do not call something verified unless the supplied context supports it."
             )
 
         if attachment_context:
             prompt_parts.append(
-                "Use the attachment analysis as grounding context. "
-                "If an attached file was marked path only, acknowledge that it was attached but not automatically analysed yet."
+                "Attachment result rules:\n"
+                "- Use the attachment analysis as grounding context.\n"
+                "- If an attached file was marked path only, acknowledge that it was attached but not automatically analysed yet.\n"
+                "- If attached content was truncated, mention that your answer is based only on the available extracted content.\n"
+                "- For resumes, documents, or code reviews, provide a direct evaluation, a score when requested, strengths, weaknesses, and specific improvements.\n"
+                "- Do not claim to see an image, read a PDF, or inspect a file if the relevant attachment analysis failed."
             )
+
+        if 7 in skill_ids:
+            prompt_parts.append(
+                "Code skill rules:\n"
+                "- Treat attached code files as source-of-truth context.\n"
+                "- Use recent code conversation context to preserve continuity across multi-turn edits.\n"
+                "- When the user says 'this', 'that', 'it', 'try again', 'fix it', or 'continue', resolve the reference from the recent code context and attached files.\n"
+                "- When the user asks to code, debug, refactor, or modify, identify the relevant functions/classes/files first.\n"
+                "- Prefer patch-style edits with exact replacement snippets when changing existing code.\n"
+                "- If multiple code files are attached, explain which file each change belongs to.\n"
+                "- Do not claim a change has been applied unless the file was actually edited by the app.\n"
+                "- Keep explanations short unless the change is complex."
+            )
+
+        if agent_loop_plan or observation_context:
+            prompt_parts.append(
+                "Agent loop response rules:\n"
+                "- Use the plan and observations to improve answer quality.\n"
+                "- Do not expose the internal loop unless the user asks for it.\n"
+                "- If the observation summary and raw context conflict, prefer the raw context and mention uncertainty.\n"
+                "- Give the final answer in the most useful format for the user's request."
+            )
+
         prompt_parts.append(f"Current user prompt:\n{prompt}")
         final_prompt = "\n\n".join(prompt_parts)
         response_token_budget = self.selected_response_tokens
@@ -2110,6 +2474,9 @@ class SimpleAgentGUI:
         if self._prompt_contains_url(prompt):
             deterministic_ids.append(2)
 
+        if self._prompt_needs_code_skill(prompt):
+            deterministic_ids.append(7)
+
         deterministic_ids.extend(self._attachment_skill_ids(attachments))
 
         if deterministic_ids:
@@ -2133,7 +2500,9 @@ class SimpleAgentGUI:
             "Use 2 only when the user provides a URL/link and asks about its content, wants it summarised, or wants information extracted from it.\n"
             "Use 4 when the user has attached an image/video or asks to analyse an attached visual file.\n"
             "Use 5 when the user has attached a readable text/code/config file such as txt, md, py, json, csv, html, css, js, sql, sh, yaml, or similar.\n"
-            "Use 0 for normal conversation, opinions, follow-up questions, local code edits, UI changes, reasoning, writing, summarising, or anything answerable from the existing chat.\n"
+            "Use 6 when the user has attached a PDF file or asks to read, summarise, extract, or analyse an attached PDF.\n"
+            "Use 7 when the user asks to code, debug, refactor, edit, implement, patch, review code, or when a code file is attached.\n"
+            "Use 0 for normal conversation, opinions, follow-up questions, UI changes, reasoning, writing, summarising, or anything answerable from the existing chat without tools.\n"
             "For short follow-ups like 'what do you think', 'explain more', 'continue', or 'is it bullish or bearish', choose 0 unless the user also explicitly asks to search online.\n"
             "When unsure, choose 0.\n\n"
         )
@@ -2186,6 +2555,8 @@ class SimpleAgentGUI:
             3: "memory_rag",
             4: "attachment_vision",
             5: "text_file_reader",
+            6: "pdf_reader",
+            7: "code_reader",
         }
         readable_skills = [skill_catalog.get(skill_id, f"unknown_{skill_id}") for skill_id in skill_ids]
         if not readable_skills:
@@ -2283,6 +2654,22 @@ class SimpleAgentGUI:
 
         return False
 
+    def _prompt_needs_code_skill(self, prompt: str) -> bool:
+        prompt_lower = prompt.strip().lower()
+        if not prompt_lower:
+            return False
+
+        code_markers = {
+            "code", "coding", "script", "function", "class", "method",
+            "bug", "debug", "error", "traceback",
+            "refactor", "implement", "implementation", "patch",
+            "edit file", "modify", "fix this", "fix it", "add feature",
+            "unit test", "pytest", "lint", "syntax",
+            "python", "javascript", "typescript", "sql", "html", "css",
+            "tkinter", "pyinstaller",
+        }
+        return any(marker in prompt_lower for marker in code_markers)
+
     def _parse_skill_ids(self, decision_text: str) -> list[int]:
         valid_skill_ids = skills.get_valid_skill_ids()
         selected_ids: list[int] = []
@@ -2324,10 +2711,28 @@ class SimpleAgentGUI:
             "text file reader": 5,
             "text file": 5,
             "read text file": 5,
-            "code file": 5,
             "attached text": 5,
-            "attached code": 5,
             "markdown file": 5,
+            "pdf_reader": 6,
+            "pdf reader": 6,
+            "pdf file": 6,
+            "read pdf": 6,
+            "attached pdf": 6,
+            "analyse pdf": 6,
+            "analyze pdf": 6,
+            "summarise pdf": 6,
+            "summarize pdf": 6,
+            "code_reader": 7,
+            "code reader": 7,
+            "code skill": 7,
+            "coding": 7,
+            "code file": 7,
+            "attached code": 7,
+            "debug code": 7,
+            "refactor code": 7,
+            "edit code": 7,
+            "patch code": 7,
+            "review code": 7,
         }
 
         for name, skill_id in skill_name_map.items():
@@ -2442,6 +2847,40 @@ class SimpleAgentGUI:
 
                     outputs.append(f"Skill {skill_id} output:\n{result}")
                     continue
+                elif skill_id == 6:
+                    self.root.after(0, lambda: self._set_loading_base("Preparing PDF reading"))
+                    result = "PDF reading will run through the local attachment PDF pipeline."
+
+                    if self.debug:
+                        debug_text = (
+                            "\n===== SKILL EXECUTION START =====\n"
+                            f"Skill id: {skill_id}\n"
+                            "Skill input: attached PDF files\n"
+                            "Skill output:\n"
+                            f"{result}\n"
+                            "===== SKILL EXECUTION END =====\n"
+                        )
+                        self._print_debug(debug_text)
+
+                    outputs.append(f"Skill {skill_id} output:\n{result}")
+                    continue
+                elif skill_id == 7:
+                    self.root.after(0, lambda: self._set_loading_base("Preparing code analysis"))
+                    result = "Code reading and coding guidance will run through the local attachment code pipeline."
+
+                    if self.debug:
+                        debug_text = (
+                            "\n===== SKILL EXECUTION START =====\n"
+                            f"Skill id: {skill_id}\n"
+                            "Skill input: code intent or attached code files\n"
+                            "Skill output:\n"
+                            f"{result}\n"
+                            "===== SKILL EXECUTION END =====\n"
+                        )
+                        self._print_debug(debug_text)
+
+                    outputs.append(f"Skill {skill_id} output:\n{result}")
+                    continue
 
                 if self.debug:
                     debug_text = (
@@ -2497,24 +2936,7 @@ class SimpleAgentGUI:
 
     def _remember_turn(self, chat: dict[str, Any], user_prompt: str, model_response: str) -> None:
         self._set_loading_base("Saving memory")
-        user_summary = self._summarise_text(
-            text=user_prompt,
-            instruction=(
-                "Summarise this user prompt for future memory. "
-                "Keep only the durable intent, key constraints, and important facts. "
-                "Use one short sentence only."
-            ),
-            max_tokens="64",
-        )
-        assistant_summary = self._summarise_text(
-            text=model_response,
-            instruction=(
-                "Summarise this assistant response for future memory. "
-                "Keep only the main outcome, decision, or useful result. "
-                "Use one short sentence only."
-            ),
-            max_tokens="64",
-        )
+        user_summary, assistant_summary = self._summarise_turn_for_memory(user_prompt, model_response)
 
         user_summary = self._clean_hidden_value(user_summary)
         assistant_summary = self._clean_hidden_value(assistant_summary)
@@ -2532,6 +2954,87 @@ class SimpleAgentGUI:
             }
         )
         chat["memory"] = memory[-self.max_memory_items :]
+
+
+    def _summarise_turn_for_memory(self, user_prompt: str, model_response: str) -> tuple[str, str]:
+        model = self._resolve_model(self.active_prompt_model_key)
+        if model is None:
+            return "", ""
+        if model["runtime"] != "mlx-lm":
+            return "", ""
+
+        model_dir = self.models_dir / model["key"]
+        local_model_path = model_dir / "model"
+        if not local_model_path.exists():
+            return "", ""
+
+        memory_prompt = (
+            "Create compact memory summaries for one conversation turn.\n"
+            "Return exactly two lines and nothing else.\n"
+            "Line 1 must start with `user_summary:` and contain one short sentence summarising the user's durable intent, key constraints, and important facts.\n"
+            "Line 2 must start with `assistant_summary:` and contain one short sentence summarising only the assistant's main outcome, decision, or useful result.\n"
+            "Do not include reasoning, analysis, markdown, bullets, JSON, or <think> tags.\n\n"
+            f"User prompt:\n{user_prompt}\n\n"
+            f"Assistant response:\n{model_response}"
+        )
+
+        env = os.environ.copy()
+        env["HF_HUB_OFFLINE"] = "1"
+        env["TRANSFORMERS_OFFLINE"] = "1"
+
+        try:
+            visible_response = self._generate_text_with_budget(
+                local_model_path=local_model_path,
+                prompt=memory_prompt,
+                max_tokens=256,
+                env=env,
+                show_thinking=False,
+            )
+        except Exception:
+            return "", ""
+
+        return self._parse_turn_memory_summary(visible_response)
+
+    def _parse_turn_memory_summary(self, text: str) -> tuple[str, str]:
+        cleaned = self._remove_hidden_prompt_thinking_leak(text)
+        cleaned = re.sub(r"```(?:json|text)?", "", cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.replace("```", "").strip()
+
+        user_summary = ""
+        assistant_summary = ""
+
+        for line in cleaned.splitlines():
+            stripped = line.strip().strip("-• ")
+            if not stripped:
+                continue
+            user_match = re.match(r"(?i)^user_summary\s*[:=-]\s*(.+)$", stripped)
+            if user_match:
+                user_summary = user_match.group(1).strip()
+                continue
+            assistant_match = re.match(r"(?i)^assistant_summary\s*[:=-]\s*(.+)$", stripped)
+            if assistant_match:
+                assistant_summary = assistant_match.group(1).strip()
+                continue
+
+        if user_summary and assistant_summary:
+            return user_summary, assistant_summary
+
+        json_like_match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if json_like_match:
+            try:
+                data = json.loads(json_like_match.group(0))
+                user_summary = str(data.get("user_summary", "")).strip()
+                assistant_summary = str(data.get("assistant_summary", "")).strip()
+                if user_summary and assistant_summary:
+                    return user_summary, assistant_summary
+            except Exception:
+                pass
+
+        compact_lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+        if len(compact_lines) >= 2:
+            return compact_lines[0], compact_lines[1]
+
+        return "", ""
 
     def _generate_chat_title(self, first_prompt: str) -> str:
         self.root.after(0, lambda: self._set_loading_base("Generating chat title"))

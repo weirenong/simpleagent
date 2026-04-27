@@ -18,6 +18,9 @@ _EMBEDDING_MODEL: Any | None = None
 DEBUG_SEARCH_FETCH = True
 USE_PLAYWRIGHT_FETCH = True
 PLAYWRIGHT_TIMEOUT_MS = 12_000
+SEARCH_DEFAULT_MAX_RESULTS = 8
+SEARCH_FETCH_TOP_PAGES = 5
+SEARCH_VARIANT_LIMIT = 3
 
 
 class DuckDuckGoHTMLParser(HTMLParser):
@@ -129,12 +132,14 @@ def get_all_skills() -> str:
             "2: scrape_url - Extract relevant information from one or more user-provided URLs and return page excerpts as grounding context.",
             "3: memory_rag - Retrieve relevant past conversation messages for context when the user refers to previous discussion.",
             "4: attachment_vision - Analyse attached images or videos with the local VL model when the user attaches visual files or asks about an attachment.",
-            "5: text_file_reader - Read attached plain-text, markdown, code, config, CSV, JSON, HTML, CSS, SQL, shell, YAML, and other text-like files from local file paths."
+            "5: text_file_reader - Read attached plain-text, markdown, code, config, CSV, JSON, HTML, CSS, SQL, shell, YAML, and other text-like files from local file paths.",
+            "6: pdf_reader - Read text from attached PDF files using local PDF text extraction.",
+            "7: code_reader - Read attached code files and provide coding, debugging, refactoring, code review, implementation, and patch-style guidance."
         ]
     )
 
 def get_valid_skill_ids() -> set[int]:
-    return {0, 1, 2, 3, 4, 5}
+    return {0, 1, 2, 3, 4, 5, 6, 7}
 
 
 def execute_skill(skill_id: int, user_prompt: str, memory_items: list[dict[str, str]] | None = None) -> str:
@@ -149,6 +154,12 @@ def execute_skill(skill_id: int, user_prompt: str, memory_items: list[dict[str, 
         return ""
     if skill_id == 5:
         # Text file reading is executed inside simple_agent.py because it needs access to local attachment paths.
+        return ""
+    if skill_id == 6:
+        # PDF reading is executed inside simple_agent.py because it needs access to local attachment paths.
+        return ""
+    if skill_id == 7:
+        # Code reading is executed inside simple_agent.py because it needs access to local attachment paths and coding context.
         return ""
     return ""
 
@@ -285,52 +296,248 @@ def scrape_url(user_prompt: str, max_urls: int = 3) -> str:
     return "\n".join(lines)
 
 
-def internet_search(query: str, max_results: int = 6) -> str:
-    query = query.strip()
-    if not query:
+
+
+def internet_search(query: str, max_results: int = SEARCH_DEFAULT_MAX_RESULTS) -> str:
+    original_query = query.strip()
+    if not original_query:
         return "Internet search skipped because the query was empty."
 
-    raw_results = _search_duckduckgo(query, max_results=max(10, max_results * 2))
-    if not raw_results:
-        return f"Internet search found no results for: {query}"
+    search_queries = _build_search_queries(original_query)[:SEARCH_VARIANT_LIMIT]
+    raw_results: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
 
-    ranked_results = _rank_results(query, raw_results)[:max_results]
-    ranked_results = _enrich_results_with_page_excerpts(query, ranked_results, max_pages=3)
+    for search_query in search_queries:
+        variant_results = _search_duckduckgo(search_query, max_results=max(12, max_results * 3))
+        for result in variant_results:
+            url = result.get("url", "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            enriched = dict(result)
+            enriched["search_query"] = search_query
+            raw_results.append(enriched)
+
+    if not raw_results:
+        return f"Internet search found no results for: {original_query}"
+
+    ranked_results = _rank_results(original_query, raw_results)
+    ranked_results = _apply_source_quality_scores(original_query, ranked_results)
+    ranked_results = ranked_results[:max_results]
+    ranked_results = _enrich_results_with_page_excerpts(
+        original_query,
+        ranked_results,
+        max_pages=SEARCH_FETCH_TOP_PAGES,
+    )
 
     print("\n===== INTERNET SEARCH RESULTS START =====")
-    print(f"Query: {query}")
+    print(f"Original query: {original_query}")
+    print("Search variants:")
+    for search_query in search_queries:
+        print(f"- {search_query}")
     for index, result in enumerate(ranked_results, start=1):
         print(f"{index}. {result.get('title', 'Untitled')}")
         print(f"   URL: {result.get('url', '')}")
+        print(f"   Domain: {_domain_from_url(result.get('url', ''))}")
         print(f"   Description: {result.get('description', 'No description available.')}")
         print(f"   Relevance score: {float(result.get('score', 0.0)):.3f}")
+        print(f"   Source quality: {float(result.get('source_quality', 0.0)):.3f}")
+        print(f"   Final score: {float(result.get('final_score', 0.0)):.3f}")
         if result.get("page_excerpt"):
             print(f"   Page excerpt: {result.get('page_excerpt')}")
     print("===== INTERNET SEARCH RESULTS END =====\n")
 
     lines = [
-        f"Internet search results for: {query}",
+        f"Internet search results for: {original_query}",
+        "Search strategy: multiple query variants were used, results were deduplicated, source quality was scored, and the top pages were fetched for richer excerpts.",
         "Extract and summarise ONLY the most relevant factual information from the following results.",
+        "Prefer reputable and primary sources over low-quality blogs, SEO pages, or suspicious domains.",
         "Do not repeat generic descriptions or page titles.",
-        "If specific answers (names, values, lists, facts) exist, prioritise them.",
-        "Always include source URLs when referencing information."
+        "If specific answers (names, values, lists, facts, dates) exist, prioritise them.",
+        "Always include source URLs when referencing information.",
     ]
     for index, result in enumerate(ranked_results, start=1):
         title = result.get("title", "Untitled")
         url = result.get("url", "")
         description = result.get("description", "No description available.")
         score = float(result.get("score", 0.0))
+        source_quality = float(result.get("source_quality", 0.0))
+        final_score = float(result.get("final_score", 0.0))
         page_excerpt = result.get("page_excerpt", "")
         result_text = (
             f"{index}. {title}\n"
             f"   URL: {url}\n"
+            f"   Domain: {_domain_from_url(url)}\n"
             f"   Description: {description}\n"
-            f"   Relevance score: {score:.3f}"
+            f"   Relevance score: {score:.3f}\n"
+            f"   Source quality score: {source_quality:.3f}\n"
+            f"   Final score: {final_score:.3f}"
         )
         if page_excerpt:
             result_text += f"\n   Page excerpt: {page_excerpt}"
         lines.append(result_text)
     return "\n".join(lines)
+# --- Search helpers for internet_search ---
+
+def _build_search_queries(query: str) -> list[str]:
+    cleaned = re.sub(r"\s+", " ", query).strip()
+    lowered = cleaned.lower()
+    queries: list[str] = [cleaned]
+
+    if _query_looks_scholarly(lowered):
+        queries.extend([
+            f"{cleaned} site:scholar.google.com OR site:arxiv.org OR site:semanticscholar.org",
+            f"{cleaned} research paper study review",
+        ])
+    elif _query_looks_encyclopedic(lowered):
+        queries.extend([
+            f"{cleaned} Wikipedia overview",
+            f"{cleaned} official source",
+        ])
+    elif _query_looks_news_or_current(lowered):
+        queries.extend([
+            f"{cleaned} Reuters AP BBC latest",
+            f"{cleaned} site:reuters.com OR site:apnews.com OR site:bbc.com",
+        ])
+    elif _query_looks_technical(lowered):
+        queries.extend([
+            f"{cleaned} official documentation",
+            f"{cleaned} GitHub documentation",
+        ])
+    elif _query_looks_financial(lowered):
+        queries.extend([
+            f"{cleaned} official investor relations SEC latest",
+            f"{cleaned} Reuters MarketWatch Yahoo Finance",
+        ])
+    else:
+        queries.extend([
+            f"{cleaned} official source",
+            f"{cleaned} overview reliable source",
+        ])
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in queries:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _query_looks_news_or_current(lowered_query: str) -> bool:
+    markers = {
+        "latest", "current", "today", "recent", "news", "breaking", "war", "conflict",
+        "price", "stock", "crypto", "earnings", "announcement", "update", "updates",
+    }
+    return any(marker in lowered_query for marker in markers)
+
+
+def _query_looks_scholarly(lowered_query: str) -> bool:
+    markers = {
+        "paper", "papers", "study", "studies", "research", "journal", "scholar",
+        "literature", "citation", "doi", "academic", "systematic review", "meta analysis",
+    }
+    return any(marker in lowered_query for marker in markers)
+
+
+def _query_looks_technical(lowered_query: str) -> bool:
+    markers = {
+        "python", "javascript", "typescript", "api", "library", "framework", "documentation",
+        "docs", "install", "error", "bug", "github", "package", "sdk", "cli",
+    }
+    return any(marker in lowered_query for marker in markers)
+
+
+def _query_looks_financial(lowered_query: str) -> bool:
+    markers = {
+        "stock", "ticker", "shares", "etf", "earnings", "revenue", "market cap", "sec filing",
+        "10-k", "10-q", "investor relations", "price target", "dividend", "crypto", "coin",
+    }
+    return any(marker in lowered_query for marker in markers)
+
+
+def _query_looks_encyclopedic(lowered_query: str) -> bool:
+    markers = {"what is", "who is", "history of", "overview", "definition", "meaning of", "explain"}
+    return any(marker in lowered_query for marker in markers)
+
+
+def _domain_from_url(url: str) -> str:
+    try:
+        domain = urllib.parse.urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+    if domain.startswith("www."):
+        domain = domain[4:]
+    return domain
+
+
+def _apply_source_quality_scores(query: str, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    lowered_query = query.lower()
+    scored_results: list[dict[str, Any]] = []
+    for result in results:
+        enriched = dict(result)
+        domain = _domain_from_url(enriched.get("url", ""))
+        source_quality = _source_quality_score(domain, lowered_query)
+        relevance_score = float(enriched.get("score", 0.0))
+        final_score = relevance_score + source_quality
+        enriched["source_quality"] = source_quality
+        enriched["final_score"] = final_score
+        scored_results.append(enriched)
+    return sorted(scored_results, key=lambda item: item.get("final_score", 0.0), reverse=True)
+
+
+def _source_quality_score(domain: str, lowered_query: str) -> float:
+    if not domain:
+        return -0.25
+
+    trusted_general = {
+        "wikipedia.org", "britannica.com", "investopedia.com",
+    }
+    trusted_news = {
+        "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk", "aljazeera.com", "theguardian.com",
+        "nytimes.com", "washingtonpost.com", "ft.com", "bloomberg.com", "cnbc.com", "npr.org",
+    }
+    trusted_research = {
+        "scholar.google.com", "arxiv.org", "semanticscholar.org", "pubmed.ncbi.nlm.nih.gov",
+        "ncbi.nlm.nih.gov", "nature.com", "science.org", "springer.com", "sciencedirect.com",
+        "ieee.org", "acm.org", "jstor.org", "ssrn.com",
+    }
+    trusted_technical = {
+        "docs.python.org", "developer.mozilla.org", "github.com", "stackoverflow.com", "pypi.org",
+        "readthedocs.io", "huggingface.co", "pytorch.org", "numpy.org", "pandas.pydata.org",
+        "openai.com", "microsoft.com", "apple.com", "google.com", "cloudflare.com",
+    }
+    trusted_finance = {
+        "sec.gov", "investor.gov", "nasdaq.com", "nyse.com", "finance.yahoo.com", "marketwatch.com",
+        "morningstar.com", "companiesmarketcap.com", "macrotrends.net", "tradingview.com",
+    }
+
+    quality = 0.0
+    if any(domain == item or domain.endswith("." + item) for item in trusted_general):
+        quality += 0.25
+    if any(domain == item or domain.endswith("." + item) for item in trusted_news):
+        quality += 0.55 if _query_looks_news_or_current(lowered_query) else 0.25
+    if any(domain == item or domain.endswith("." + item) for item in trusted_research):
+        quality += 0.55 if _query_looks_scholarly(lowered_query) else 0.25
+    if any(domain == item or domain.endswith("." + item) for item in trusted_technical):
+        quality += 0.45 if _query_looks_technical(lowered_query) else 0.20
+    if any(domain == item or domain.endswith("." + item) for item in trusted_finance):
+        quality += 0.45 if _query_looks_financial(lowered_query) else 0.20
+
+    suspicious_markers = {
+        "blogspot.", "wordpress.", "medium.com", "quora.com", "reddit.com", "pinterest.",
+        "fandom.com", "wiki.gg", "answers.com", "slideshare.", "scribd.",
+    }
+    if any(marker in domain for marker in suspicious_markers):
+        quality -= 0.15
+
+    spam_markers = {"coupon", "casino", "betting", "free-download", "apk", "lyrics"}
+    if any(marker in domain for marker in spam_markers):
+        quality -= 0.35
+
+    return quality
 
 
 def _search_duckduckgo(query: str, max_results: int = 10) -> list[dict[str, Any]]:
@@ -545,7 +752,7 @@ def _best_page_excerpt(query: str, page_text: str, max_chars: int = 900) -> str:
         scored_chunks = [(0.0, chunk) for chunk in chunks[:8]]
 
     key_items = _extract_key_items(query, chunks)
-    best_chunks = [chunk for _, chunk in sorted(scored_chunks, key=lambda item: item[0], reverse=True)[:6]]
+    best_chunks = [chunk for _, chunk in sorted(scored_chunks, key=lambda item: item[0], reverse=True)[:8]]
     excerpt = " | ".join(best_chunks)
     if key_items:
         excerpt = "Key extracted items: " + ", ".join(key_items[:10]) + " | " + excerpt

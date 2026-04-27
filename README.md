@@ -6,7 +6,7 @@
 
 SimpleAgent is a local-first desktop AI agent built for Apple Silicon.
 
-It runs small local models with MLX and gives them a practical agent system around them: memory, skills, file attachments, web search, vision analysis, text-file reading, and a simple GUI.
+It runs small local models with MLX and gives them a practical agent system around them: memory, skill routing, an agent loop, file attachments, web search, URL scraping, vision analysis, text-file reading, PDF reading, code-file reading, and a simple GUI.
 
 The goal is simple:
 
@@ -27,11 +27,15 @@ It can:
 - search the web when needed
 - scrape user-provided URLs
 - remember recent conversation summaries
-- read attached text and code files
+- use a lightweight agent loop to plan, act, observe, and answer
+- read attached text and config files
+- read attached PDF files
+- read attached code files as a dedicated coding skill
 - analyse attached images and videos with a vision model
 - paste images directly from clipboard as attachments
 - drag and drop files into the chat
 - pin attachments so they stay available across prompts
+- keep recent coding conversation context for multi-turn code edits
 - display debug logs and raw model outputs in a console window
 - show response time and token allowance after each reply
 - render markdown-style formatting in the GUI
@@ -99,6 +103,35 @@ This helps the model understand phrases like:
 
 ---
 
+### Lightweight Agent Loop
+
+SimpleAgent now uses a lightweight agent loop for higher-quality answers.
+
+The loop is:
+
+```text
+Think
+↓
+Act
+↓
+Observe
+↓
+Respond
+```
+
+In practice, this means:
+
+| Step | What SimpleAgent does |
+|---|---|
+| Think | Understands the user's intent and what evidence is needed |
+| Act | Runs selected skills such as web search, URL scraping, memory search, attachment reading, vision, PDF reading, or code reading |
+| Observe | Summarises and filters tool results so the final answer focuses on the user's actual request |
+| Respond | Gives the final answer without exposing the internal loop |
+
+The observation step is only used when it is useful, such as for tool results, PDFs, code files, resumes, documents, and large attachment context. Normal chat stays lightweight.
+
+---
+
 ### Skill Routing
 
 SimpleAgent uses numbered skills instead of complex JSON tool calls.
@@ -110,7 +143,9 @@ SimpleAgent uses numbered skills instead of complex JSON tool calls.
 | 2 | `scrape_url` | Read and extract information from a URL |
 | 3 | `memory_rag` | Search previous memory summaries |
 | 4 | `attachment_vision` | Analyse attached images or videos |
-| 5 | `text_file_reader` | Read attached text, code, markdown, config, CSV, JSON, SQL, HTML, CSS, shell, YAML, and similar files |
+| 5 | `text_file_reader` | Read attached text, markdown, config, CSV, JSON, YAML, and other text-like files |
+| 6 | `pdf_reader` | Read extractable text from attached PDF files |
+| 7 | `code_reader` | Read attached code files and support coding, debugging, refactoring, code review, implementation, and patch-style guidance |
 
 The router can select one or more skills before generating the final answer.
 
@@ -146,20 +181,28 @@ The search flow is:
 ```text
 User prompt
 ↓
-Generate search query
+Generate multiple search query variants
 ↓
 Search online
 ↓
-Rank results
+Deduplicate results
 ↓
-Extract relevant snippets
+Rank by relevance
 ↓
-Add search context to final prompt
+Re-rank with source quality scoring
+↓
+Fetch richer excerpts from top pages
+↓
+Observe and filter the results
+↓
+Add refined search context to final prompt
 ↓
 Generate answer
 ```
 
 Search result ranking can use MiniLM embeddings when available, with a keyword fallback.
+
+The search system also applies lightweight source-quality scoring. It can boost more reputable sources depending on the query type, such as Reuters/AP/BBC for news, arXiv/Semantic Scholar/PubMed for research, official documentation for technical questions, and SEC/Yahoo Finance/Nasdaq-style sources for finance.
 
 ---
 
@@ -195,6 +238,8 @@ This is useful for:
 ### Memory
 
 SimpleAgent stores lightweight memory after each turn.
+
+The user and assistant summaries are generated together in one compact memory pass to reduce hidden compute.
 
 After every response, it creates:
 
@@ -273,26 +318,25 @@ The vision model is run in a separate subprocess, so it is released from memory 
 
 ---
 
-### Text and Code File Attachments
+### Text File Attachments
 
-Text-like files are routed to the text file reader skill.
+Text-like non-code files are routed to the text file reader skill.
 
 Supported examples include:
 
 ```text
 .txt, .md, .markdown, .rst, .log,
-.py, .js, .ts, .html, .css, .sql,
-.json, .yaml, .yml, .toml, .ini,
 .csv, .tsv,
-.sh, .bash, .zsh,
-.java, .cpp, .cs, .go, .rs, .php,
-.env, .gitignore, .dockerignore
+.json, .jsonl,
+.yaml, .yml, .toml, .ini, .cfg, .conf,
+.env, .xml, .tex, .bib,
+.gitignore, .dockerignore, .editorconfig, .lock
 ```
 
 The text file flow is:
 
 ```text
-Attach text/code file
+Attach text/config/data file
 ↓
 Skill 5 selected
 ↓
@@ -303,14 +347,113 @@ Content is added to prompt
 Model answers using the file content
 ```
 
-This makes it possible to attach multiple scripts and ask the model to:
+This is useful for:
 
-- explain code
-- find bugs
-- suggest refactors
-- compare files
-- write new functions
-- propose patch-style edits
+- notes
+- markdown documents
+- config files
+- CSV or TSV files
+- JSON or YAML files
+- logs
+- plain-text references
+
+---
+
+### PDF Attachments
+
+PDF files are routed to the PDF reader skill.
+
+Supported extension:
+
+```text
+.pdf
+```
+
+The PDF flow is:
+
+```text
+Attach PDF
+↓
+Skill 6 selected
+↓
+PDF text is extracted locally
+↓
+Extracted text is added to prompt
+↓
+Agent observes the document content when useful
+↓
+Model answers using the PDF content
+```
+
+This can be used for:
+
+- resumes
+- reports
+- papers
+- invoices
+- forms with extractable text
+- general document review
+
+PDF parsing uses local text extraction. Scanned or image-based PDFs may not contain extractable text.
+
+---
+
+### Code File Attachments
+
+Code files are routed to a dedicated coding skill instead of the generic text reader.
+
+Supported examples include:
+
+```text
+.py, .pyw, .ipynb, .sql,
+.js, .jsx, .ts, .tsx, .mjs, .cjs,
+.html, .htm, .css, .scss, .sass, .less,
+.sh, .bash, .zsh, .fish, .bat, .ps1,
+.java, .kt, .kts,
+.c, .h, .cpp, .hpp, .cc, .cs,
+.go, .rs, .swift, .php, .rb, .lua,
+.r, .m, .scala, .dart,
+.vue, .svelte, .astro
+```
+
+The code flow is:
+
+```text
+Attach code file or ask a coding question
+↓
+Skill 7 selected
+↓
+Code content is read locally
+↓
+Recent code conversation context is added when relevant
+↓
+Agent observes the code context when useful
+↓
+Model gives coding guidance or patch-style edits
+```
+
+This is useful for:
+
+- explaining code
+- finding bugs
+- debugging errors
+- refactoring
+- reviewing code
+- implementing features
+- comparing multiple files
+- generating patch-style edits
+
+For multi-turn coding, SimpleAgent also includes recent code-related conversation context. This helps with follow-up prompts like:
+
+```text
+try again
+fix it
+continue
+change the previous solution
+apply the same idea to the other file
+```
+
+Attached code files remain the source of truth.
 
 ---
 
@@ -327,6 +470,7 @@ Attach simple_agent.py
 Pin it
 Ask: explain this file
 Ask: where should I add PDF support?
+Ask: split coding into its own skill
 Ask: suggest a cleaner module split
 ```
 
@@ -360,6 +504,8 @@ It shows useful debugging information such as:
 - skill inputs
 - skill outputs
 - model errors
+- PDF extraction warnings
+- agent loop observation steps
 - response logs
 
 This makes the agent easier to debug without relying only on the PyCharm terminal.
@@ -398,6 +544,8 @@ The app also shows response time after each reply, for example:
 Response generated. Tokens used allowance: 32768 • Time: 46.9s
 ```
 
+Hidden helper prompts are kept as small as possible. Memory summarisation now combines the user and assistant summaries in one call to reduce compute.
+
 ---
 
 ## Model Setup
@@ -415,6 +563,8 @@ The main model handles chat and reasoning.
 The vision model handles image and video attachments.
 
 The embedding model helps with semantic ranking for memory and search results.
+
+PDF reading uses local PDF text extraction through Python libraries such as `pypdf`.
 
 ---
 
@@ -466,6 +616,12 @@ pip install playwright
 python -m playwright install chromium
 ```
 
+For PDF attachments:
+
+```bash
+pip install pypdf
+```
+
 ---
 
 ## Setup
@@ -488,7 +644,7 @@ source .venv/bin/activate
 
 ```bash
 pip install -U pip
-pip install mlx-lm mlx-vlm sentence-transformers huggingface-hub pillow tkinterdnd2 torch torchvision
+pip install mlx-lm mlx-vlm sentence-transformers huggingface-hub pillow tkinterdnd2 torch torchvision pypdf
 ```
 
 Optional for webpage scraping:
@@ -548,7 +704,9 @@ High-level flow:
 ```text
 User sends message
 ↓
-Save user message
+Save user message and attachments
+↓
+Prepare SimpleAgent identity context
 ↓
 Prepare date/time context
 ↓
@@ -560,13 +718,17 @@ Run selected skills
 ↓
 Read or analyse attachments
 ↓
+Build agent loop plan
+↓
+Observe tool and attachment results when useful
+↓
 Build final prompt
 ↓
 Generate answer with local model
 ↓
 Save assistant response
 ↓
-Summarise turn into memory
+Summarise user and assistant turn into memory in one pass
 ↓
 Update GUI
 ```
@@ -613,9 +775,10 @@ Known limitations:
 - Some websites may block scraping.
 - JavaScript-heavy pages need Playwright.
 - Vision analysis requires the correct MLX-VLM model and dependencies.
-- Text attachments can become very large and slow down responses.
-- The model can suggest code changes, but automatic patch application is not yet part of the core workflow.
-- PDF, DOCX, XLSX, and PPTX files are not deeply parsed yet unless converted or handled through future skills.
+- Text, PDF, and code attachments can become very large and slow down responses.
+- The code skill can suggest patch-style edits, but automatic patch application is not yet part of the core workflow.
+- PDF reading works best for PDFs with extractable text; scanned PDFs may need image conversion or vision analysis.
+- DOCX, XLSX, and PPTX files are not deeply parsed yet unless converted or handled through future skills.
 
 ---
 
