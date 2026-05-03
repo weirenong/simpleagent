@@ -1,3 +1,5 @@
+This project has been succeeded by simpleagenttui and is not longer in development: https://github.com/weirenong/simpleagenttui
+
 # SimpleAgent — Lightweight Local AI Agent
 
 <p align="center">
