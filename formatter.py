@@ -32,6 +32,9 @@ class TuiFormatter:
     def red(self, text: str) -> str:
         return self.colour(text, "91")
 
+    def dark_yellow(self, text: str) -> str:
+        return self.colour(text, "33")
+
     def print_info(self, text: str) -> None:
         print(self.blue("[info]"), text)
 
@@ -46,18 +49,52 @@ class TuiFormatter:
 
     def collect_code_block(self, lines: list[str], start_index: int) -> tuple[list[str], str, int]:
         opening = lines[start_index].strip()
-        language = opening[3:].strip()
+        fence_match = re.match(r"^(`{3,}|~{3,})(.*)$", opening)
+
+        if not fence_match:
+            return [], "", start_index + 1
+
+        opening_fence = fence_match.group(1)
+        language = fence_match.group(2).strip()
         code_lines: list[str] = []
         index = start_index + 1
 
+        if self.is_markdown_language(language):
+            closing_index = self.find_markdown_code_block_close(lines, start_index, opening_fence)
+
+            while index < closing_index:
+                code_lines.append(lines[index])
+                index += 1
+
+            return code_lines, language, min(closing_index + 1, len(lines))
+
         while index < len(lines):
-            if lines[index].strip().startswith("```"):
+            stripped = lines[index].strip()
+            if stripped.startswith(opening_fence):
                 return code_lines, language, index + 1
 
             code_lines.append(lines[index])
             index += 1
 
         return code_lines, language, index
+
+    def is_markdown_language(self, language: str) -> bool:
+        return language.strip().lower() in {"md", "markdown", "mdown", "mkd"}
+
+    def find_markdown_code_block_close(self, lines: list[str], start_index: int, opening_fence: str) -> int:
+        closing_indexes = [
+            index
+            for index in range(start_index + 1, len(lines))
+            if lines[index].strip().startswith(opening_fence)
+        ]
+
+        if not closing_indexes:
+            return len(lines)
+
+        # Markdown files commonly contain nested fenced code examples. When an entire
+        # markdown document is itself wrapped in a markdown fence, the safest terminal
+        # rendering choice is to treat the final matching fence as the outer close.
+        return closing_indexes[-1]
 
     def print_tui_code_block(self, code_lines: list[str], language: str = "") -> None:
         width = self.safe_terminal_width()
@@ -73,18 +110,58 @@ class TuiFormatter:
         if not code_lines:
             print("")
         else:
+            is_diff_block = self.is_diff_language(language)
             for code_line in code_lines:
-                print(self.colour(code_line, "97"))
+                if is_diff_block:
+                    print(self.format_diff_line(code_line))
+                else:
+                    print(self.colour(code_line, "97"))
 
         print()
         print(self.dim(bottom))
 
+    def is_diff_language(self, language: str) -> bool:
+        return language.strip().lower() in {"diff", "patch", "udiff"}
+
+    def format_diff_line(self, line: str) -> str:
+        risky_prefix = "\x00RISKY\x00"
+        if line.startswith(risky_prefix):
+            return self.dark_yellow(line.removeprefix(risky_prefix))
+
+        stripped = line.strip()
+
+        if stripped.startswith("+++") or stripped.startswith("---"):
+            return self.colour(line, "96;1")
+
+        if stripped.startswith("@@"):
+            return self.colour(line, "94;1")
+
+        if stripped.startswith("+"):
+            return self.colour(line, "92")
+
+        if stripped.startswith("-"):
+            return self.colour(line, "91")
+
+        if stripped.startswith("diff ") or stripped.startswith("index "):
+            return self.dim(line)
+
+        return self.colour(line, "97")
+
     def print_tui_markdown(self, text: str) -> None:
-        lines = text.strip("\n").splitlines()
+        if not getattr(self, "format_agent_replies", True):
+            print(text, end="" if text.endswith("\n") else "\n")
+            return
+
+        lines = text.splitlines()
         index = 0
 
         while index < len(lines):
             line = lines[index]
+
+            if self.is_raw_diff_start(lines, index):
+                diff_lines, index = self.collect_raw_diff_block(lines, index)
+                self.print_tui_code_block(diff_lines, "diff")
+                continue
 
             if self.is_code_block_start(line):
                 code_lines, language, index = self.collect_code_block(lines, index)
@@ -101,6 +178,104 @@ class TuiFormatter:
 
             self.print_tui_line(line)
             index += 1
+
+    def is_raw_diff_start(self, lines: list[str], index: int) -> bool:
+        if index + 1 >= len(lines):
+            return False
+
+        current = lines[index].strip()
+        next_line = lines[index + 1].strip()
+
+        return current.startswith("--- ") and next_line.startswith("+++ ")
+
+    def collect_raw_diff_block(self, lines: list[str], start_index: int) -> tuple[list[str], int]:
+        diff_lines: list[str] = []
+        index = start_index
+        seen_hunk_header = False
+        blank_count = 0
+
+        while index < len(lines):
+            line = lines[index]
+            stripped = line.strip()
+
+            if index > start_index and self.is_raw_diff_start(lines, index):
+                break
+
+            if stripped.startswith("@@"):
+                seen_hunk_header = True
+                blank_count = 0
+                diff_lines.append(line)
+                index += 1
+                continue
+
+            if not stripped:
+                blank_count += 1
+                if seen_hunk_header and blank_count <= 2:
+                    diff_lines.append(line)
+                    index += 1
+                    continue
+                break
+
+            blank_count = 0
+
+            if self.is_raw_diff_continuation(line):
+                diff_lines.append(line)
+                index += 1
+                continue
+
+            if seen_hunk_header and self.is_likely_diff_hunk_body_line(line):
+                diff_lines.append(line)
+                index += 1
+                continue
+
+            break
+
+        return diff_lines, index
+
+    def is_likely_diff_hunk_body_line(self, line: str) -> bool:
+        stripped = line.strip()
+
+        if not stripped:
+            return True
+
+        prose_starters = (
+            "we need ",
+            "i need ",
+            "the user ",
+            "original ",
+            "explanation",
+            "reason:",
+            "note:",
+            "stats:",
+            "press ",
+        )
+        lower = stripped.lower()
+        if lower.startswith(prose_starters):
+            return False
+
+        return True
+
+    def is_raw_diff_continuation(self, line: str) -> bool:
+        stripped = line.strip()
+
+        if not stripped:
+            return True
+
+        return (
+            stripped.startswith("--- ")
+            or stripped.startswith("+++ ")
+            or stripped.startswith("@@")
+            or line.startswith("+")
+            or line.startswith("-")
+            or line.startswith(" ")
+            or stripped.startswith("diff ")
+            or stripped.startswith("index ")
+            or stripped.startswith("new file mode ")
+            or stripped.startswith("deleted file mode ")
+            or stripped.startswith("similarity index ")
+            or stripped.startswith("rename from ")
+            or stripped.startswith("rename to ")
+        )
 
     def print_tui_line(self, line: str) -> None:
         stripped = line.strip()

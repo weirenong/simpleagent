@@ -19,8 +19,13 @@ from urllib.parse import urlparse
 from datetime import datetime
 from pathlib import Path
 
+import workflows.workflow as workflows
+
 import utils
 from formatter import TuiFormatter
+
+import editblock
+from editblock import EditStrategy
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion, CompleteEvent
@@ -30,14 +35,19 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.application.run_in_terminal import run_in_terminal
+from prompt_toolkit.application import Application
+from prompt_toolkit.layout.containers import HSplit
+from prompt_toolkit.layout import Layout
+from prompt_toolkit.widgets import CheckboxList, RadioList, Dialog, Button, Label, Box
+from prompt_toolkit.styles import Style
 
 from ollama import OllamaClient, OllamaConfig
 from utils import VectorMemoryIndex, vectorise_text
 
 from PIL import Image, ImageGrab
 
-VERSION = "0.1.0"
-APP_NAME = "SimpleAgent TUI"
+VERSION = "0.2.3"
+APP_NAME = "SimpleAgent"
 DEFAULT_MODEL = "nemotron-3-nano:4b"
 DEFAULT_EMBEDDING_MODEL = "ordis/jina-embeddings-v2-base-code:latest"
 DEFAULT_VISION_MODEL = "granite3.2-vision:2b"
@@ -51,8 +61,17 @@ MIN_ATTACHMENT_CONTEXT_TOKENS = 1_500
 MAX_ATTACHMENT_CONTEXT_TOKENS = 6_000
 RESERVED_RESPONSE_TOKENS = 1_500
 
-CONFIG_DIR = Path.home() / ".simpleagent-cli"
+CONFIG_DIR = Path.home() / ".simpleagent"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+USER_WORKFLOWS_DIR = CONFIG_DIR / "workflows"
+PROJECT_WORKFLOWS_DIR = Path(__file__).resolve().parent / "workflows"
+DEFAULT_WORKFLOW_PATH = PROJECT_WORKFLOWS_DIR / "default.md"
+
+DEFAULT_WORKFLOW_NAME = "default"
+DEFAULT_PERSONA_WORKFLOWS = {
+    "Default": "default",
+    "Coding": "coding",
+}
 
 ATTACHMENTS_DIR = CONFIG_DIR / "attachments"
 
@@ -67,22 +86,26 @@ SUPPORTED_ATTACHMENT_EXTENSIONS = (
 IMAGE_ATTACHMENT_EXTENSIONS = utils.IMAGE_ATTACHMENT_EXTENSIONS
 
 COMMANDS = {
-    "/help": "Show this help menu",
+    "/attach": "Attach supported files by path",
+    "/web": "Load a URL or search and store ranked web context",
+    "/paste": "Paste text or image from the clipboard",
+    "/clear": "Clear current session history",
+    "/code": "Review/apply search & replace blocks from the last assistant reply",
     "/model": "Show or change the Ollama chat model",
     "/embedding": "Show or change the Ollama embeddings model",
     "/vision": "Show or change the Ollama vision model",
-    "/attach": "Attach supported files by path",
-    "/paste": "Paste text or image from the clipboard",
-    "/web": "Load a URL or search and store ranked web context",
     "/models": "List installed Ollama models",
     "/select-model": "Select and persist an installed Ollama chat model",
     "/select-embedding": "Select and persist an installed Ollama embeddings model",
-    "/system": "Show or set the system prompt",
-    "/system-reset": "Reset the system prompt",
+    "/persona": "Open persona manager for system prompt profiles",
+    "/workflow": "Help text for assigning workflows",
+    "/workflow-install": "Install a workflow .md file and create a persona for it",
+    "/workflow-debug": "Print the full prompt messages sent during last run",
+    "/markup": "Toggle markdown-style formatting for agent replies",
     "/history": "Show current session history",
-    "/clear": "Clear current session history",
     "/about": "Show app info",
     "/version": "Show version",
+    "/help": "Show this help menu",
     "/exit": "Exit app",
     "/quit": "Exit app",
     "/q": "Exit app",
@@ -90,6 +113,7 @@ COMMANDS = {
 
 
 COMMAND_USAGE = {
+    "/code": "/code",
     "/model": "/model <name>",
     "/embedding": "/embedding <name>",
     "/vision": "/vision <name>",
@@ -98,7 +122,11 @@ COMMAND_USAGE = {
     "/web": "/web <url or search query>",
     "/select-model": "/select-model",
     "/select-embedding": "/select-embedding",
-    "/system": "/system <prompt>",
+    "/persona": "/persona",
+    "/workflow": "/workflow",
+    "/workflow-install": "/workflow-install <path-to-workflow.md>",
+    "/workflow-debug": "/workflow-debug",
+    "/markup": "/markup",
 }
 
 THINK_BLOCK_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
@@ -143,7 +171,7 @@ BOLD = "\033[1m"
 RESET = "\033[0m"
 
 MASCOT_LINES = [
-    f"  ▗▄▄▄▄▄▄▖    {BOLD}SimpleAgent TUI{RESET} v{VERSION}",
+    f"  ▗▄▄▄▄▄▄▖    {BOLD}{APP_NAME}{RESET} v{VERSION}",
     " ▐▌> ██ <▐▌   Tiny local AI for tiny machines",
     " ▐▌   ▾  ▐▌   Work work · ship ship",
     "  ▝▀▛██▜▀▘    by Weiren.Ong, 2026",
@@ -180,6 +208,10 @@ class SlashCommandCompleter(Completer):
         if not text.startswith("/"):
             return
 
+        if text.startswith("/attach "):
+            yield from self.get_attach_path_completions(text)
+            return
+
         current = text.split(" ", 1)[0]
 
         for command, description in COMMANDS.items():
@@ -191,17 +223,166 @@ class SlashCommandCompleter(Completer):
                     display_meta=command_preview(command, description),
                 )
 
+    def get_attach_path_completions(self, text: str):
+        argument_text = text[len("/attach "):]
+        fragment = self.current_attach_fragment(argument_text)
+        project_dir = Path.cwd().resolve()
 
-DEFAULT_SYSTEM_PROMPT = """
-You are SimpleAgent, a lightweight local AI assistant running through Ollama.
+        for path in list_attach_completion_candidates(project_dir, fragment):
+            relative_path = path.relative_to(project_dir).as_posix()
+            completion_text = shlex.quote(relative_path)
 
-Rules:
-- Be useful, direct, and practical.
-- Keep answers clear and structured.
-- If the user asks for code, provide working code.
-- Do not pretend to have tools that are not currently connected.
-- If more context is needed, ask a short follow-up question.
+            yield Completion(
+                text=completion_text,
+                start_position=-len(fragment),
+                display=relative_path,
+                display_meta="directory" if path.is_dir() else "file",
+            )
+
+    def current_attach_fragment(self, argument_text: str) -> str:
+        if not argument_text:
+            return ""
+
+        parts = re.split(r"\s+", argument_text)
+        return parts[-1] if parts else ""
+
+def list_attach_completion_candidates(project_dir: Path, fragment: str) -> list[Path]:
+    cleaned_fragment = fragment.strip().strip("'\"")
+    candidates: list[Path] = []
+
+    for path in project_dir.rglob("*"):
+        if should_skip_attach_completion_candidate(project_dir, path):
+            continue
+
+        if path.is_file() and path.suffix.lower() not in SUPPORTED_ATTACHMENT_EXTENSIONS:
+            continue
+
+        relative_path = path.relative_to(project_dir).as_posix()
+        if cleaned_fragment and not relative_path.startswith(cleaned_fragment):
+            continue
+
+        candidates.append(path)
+
+    return sorted(
+        candidates,
+        key=lambda path: (
+            len(path.relative_to(project_dir).parts),
+            path.relative_to(project_dir).as_posix().lower(),
+            not path.is_file(),
+        ),
+    )
+
+
+def should_skip_attach_completion_candidate(project_dir: Path, path: Path) -> bool:
+    try:
+        relative_path = path.relative_to(project_dir)
+    except ValueError:
+        return True
+
+    blocked_parts = {
+        ".git",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "node_modules",
+        ".idea",
+        ".pytest_cache",
+        ".mypy_cache",
+    }
+
+    if set(relative_path.parts) & blocked_parts:
+        return True
+
+    return is_gitignored_for_attach_completion(project_dir, relative_path.as_posix())
+
+
+def is_gitignored_for_attach_completion(project_dir: Path, relative_path: str) -> bool:
+    gitignore_path = project_dir / ".gitignore"
+    if not gitignore_path.exists():
+        return False
+
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "--quiet", "--", relative_path],
+            cwd=project_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return matches_simple_gitignore_rule_for_attach_completion(gitignore_path, relative_path)
+
+
+def matches_simple_gitignore_rule_for_attach_completion(gitignore_path: Path, relative_path: str) -> bool:
+    try:
+        lines = gitignore_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+
+    path = relative_path.strip("/")
+    ignored = False
+
+    for raw_line in lines:
+        rule = raw_line.strip()
+        if not rule or rule.startswith("#"):
+            continue
+
+        negated = rule.startswith("!")
+        if negated:
+            rule = rule[1:].strip()
+
+        if not rule:
+            continue
+
+        directory_rule = rule.endswith("/")
+        rule = rule.strip("/")
+        matched = False
+
+        if directory_rule:
+            matched = path.startswith(rule + "/")
+        elif "*" in rule:
+            pattern = re.escape(rule).replace("\\*", ".*")
+            matched = re.fullmatch(pattern, path) is not None
+        else:
+            matched = path == rule or path.startswith(rule + "/") or path.endswith("/" + rule)
+
+        if matched:
+            ignored = not negated
+
+    return ignored
+
+BUILT_IN_PERSONA_NAMES = {"Default", "Coding"}
+
+
+DEFAULT_PERSONA_PROMPT = """
+You are SimpleAgent, an agent built for fast, practical work.
+
+Operating rules:
+- Be concise, high-signal, and action-oriented.
+- Prefer tables, short sections, and concrete next steps when useful.
+- Use available context first: current chat, memory, attachments, web context, and tool output.
+- Do not invent tool access, file contents, web facts, or execution results.
+- If context is missing, ask one focused question or state the assumption and proceed.
+- For multi-step tasks, plan briefly, execute directly, then self-check the result.
+- Avoid long theory unless the user asks for it or the task requires it.
+- Preserve the user's intent, tone, and constraints.
 """.strip()
+
+DEFAULT_CODING_PERSONA_PROMPT = """
+You are SimpleAgent Coder, an expert software developer.
+You will always output code in the search and replace format:
+<<<<<<< SEARCH
+[exact code to search for]
+=======
+[exact code to replace with]
+>>>>>>> REPLACE
+""".strip()
+
+DEFAULT_PERSONAS = {
+    "Default": DEFAULT_PERSONA_PROMPT,
+    "Coding": DEFAULT_CODING_PERSONA_PROMPT,
+}
 
 
 def load_config() -> dict:
@@ -223,13 +404,66 @@ def save_config(config: dict) -> None:
 
 class SimpleAgentTUI(TuiFormatter):
     def __init__(self) -> None:
+        self.project_dir = Path.cwd().resolve()
         self.config = load_config()
         self.model = os.getenv("SIMPLEAGENT_MODEL") or self.config.get("model", DEFAULT_MODEL)
         self.host = os.getenv("OLLAMA_HOST") or self.config.get("host", "http://localhost:11434")
         self.embedding_model = self.config.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
         self.vision_model = self.config.get("vision_model", DEFAULT_VISION_MODEL)
-        self.system_prompt = self.config.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+        legacy_system_prompt = self.config.get("system_prompt")
+        configured_personas = self.config.get("personas")
+
+        if not isinstance(configured_personas, dict) or not configured_personas:
+            configured_personas = {
+                "Default": legacy_system_prompt or DEFAULT_PERSONA_PROMPT,
+            }
+
+        for persona_name, persona_prompt in DEFAULT_PERSONAS.items():
+            configured_personas[persona_name] = persona_prompt
+
+        self.personas: dict[str, str] = {
+            str(name): str(prompt)
+            for name, prompt in configured_personas.items()
+            if str(name).strip() and str(prompt).strip()
+        }
+
+        if not self.personas:
+            self.personas = {"Default": DEFAULT_PERSONA_PROMPT}
+
+        for persona_name, persona_prompt in DEFAULT_PERSONAS.items():
+            self.personas[persona_name] = persona_prompt
+
+        configured_active_persona = str(self.config.get("active_persona") or "Default")
+        self.active_persona = (
+            configured_active_persona
+            if configured_active_persona in self.personas
+            else "Default"
+            if "Default" in self.personas
+            else next(iter(self.personas))
+        )
+        self.system_prompt = self.personas[self.active_persona]
+        configured_persona_workflows = self.config.get("persona_workflows")
+        if not isinstance(configured_persona_workflows, dict):
+            configured_persona_workflows = {}
+        self.persona_workflows: dict[str, str] = {
+            str(name): str(workflow_name)
+            for name, workflow_name in configured_persona_workflows.items()
+            if str(name).strip() and str(workflow_name).strip()
+        }
+        for persona_name in self.personas:
+            self.persona_workflows.setdefault(
+                persona_name,
+                DEFAULT_PERSONA_WORKFLOWS.get(persona_name, DEFAULT_WORKFLOW_NAME),
+            )
+
+        for persona_name, workflow_name in DEFAULT_PERSONA_WORKFLOWS.items():
+            if persona_name in self.personas:
+                self.persona_workflows[persona_name] = workflow_name
+        self.save_persona_config()
         self.messages: list[dict[str, str]] = []
+        self.max_recent_messages = MAX_RECENT_MESSAGES
+        self.workflow_runner = self.build_workflow_runner_for_persona(self.active_persona)
+        self.last_workflow_messages: list[dict[str, str]] = []
         self.memory_items: list[dict] = []
         self.memory_index = VectorMemoryIndex(embedding_key="embedding")
         self.attachments: list[dict[str, str]] = []
@@ -244,6 +478,7 @@ class SimpleAgentTUI(TuiFormatter):
         self.last_thinking: str = ""
         self.last_visible_reply: str = ""
         self.show_thinking: bool = False
+        self.format_agent_replies: bool = bool(self.config.get("format_agent_replies", True))
         self.is_streaming_response: bool = False
         self.loading_active: bool = False
         self.loading_thread: threading.Thread | None = None
@@ -259,7 +494,7 @@ class SimpleAgentTUI(TuiFormatter):
         def _(event):
             buffer = event.current_buffer
             buffer.insert_text("/")
-            buffer.start_completion(select_first=False)
+            buffer.start_completion(select_first=True)
             event.app.invalidate()
 
         @self.key_bindings.add("enter")
@@ -287,6 +522,13 @@ class SimpleAgentTUI(TuiFormatter):
             run_in_terminal(self.toggle_thinking)
             event.app.invalidate()
 
+        @self.key_bindings.add("escape")
+        def clear_slash_command(event) -> None:
+            buffer = event.app.current_buffer
+            if buffer.text.lstrip().startswith("/"):
+                buffer.text = ""
+                buffer.cursor_position = 0
+
         self.session = PromptSession(
             completer=SlashCommandCompleter(),
             complete_while_typing=True,
@@ -310,6 +552,31 @@ class SimpleAgentTUI(TuiFormatter):
 
         self.install_resize_handler()
 
+    def review_last_code_blocks(self, strategy: "EditStrategy | None" = None) -> None:
+        if not getattr(self, "last_visible_reply", ""):
+            print()
+            self.print_dim("No assistant reply available yet. Send a prompt first, then run /code.")
+            print()
+            return
+
+        if strategy is None:
+            # Auto-detect: if the reply contains SEARCH markers use search/replace,
+            # else fall back to whole-file.
+            reply = self.last_visible_reply
+            if "<<<<<<< SEARCH" in reply or "<<<<<<< search" in reply.lower():
+                strategy = EditStrategy.SEARCH_REPLACE
+            elif "--- a/" in reply or "--- a\\" in reply:
+                strategy = EditStrategy.UNIFIED_DIFF
+            else:
+                strategy = EditStrategy.WHOLE_FILE
+
+        editblock.apply_llm_edits(
+            app=self,
+            llm_output=self.last_visible_reply,
+            strategy=strategy,
+            title="Code edit review from last assistant reply",
+        )
+
     def install_resize_handler(self) -> None:
         if not hasattr(signal, "SIGWINCH"):
             return
@@ -318,6 +585,211 @@ class SimpleAgentTUI(TuiFormatter):
             run_in_terminal(self.handle_resize)
 
         signal.signal(signal.SIGWINCH, _handle_resize)
+
+    def toggle_agent_reply_markup(self) -> None:
+        self.format_agent_replies = not self.format_agent_replies
+        self.config["format_agent_replies"] = self.format_agent_replies
+        save_config(self.config)
+
+        status = "on" if self.format_agent_replies else "off"
+        print()
+        self.print_info(f"Agent reply markup formatting: {status}")
+        if not self.format_agent_replies:
+            self.print_dim("Raw replies are useful for /code because SEARCH/REPLACE markers stay untouched.")
+        print()
+
+    def save_persona_config(self) -> None:
+        self.config["personas"] = dict(self.personas)
+        self.config["active_persona"] = self.active_persona
+        self.config["persona_workflows"] = dict(self.persona_workflows)
+        self.config.pop("system_prompt", None)
+        save_config(self.config)
+
+    def set_active_persona(self, persona_name: str) -> None:
+        if persona_name not in self.personas:
+            raise ValueError(f"Persona not found: {persona_name}")
+
+        self.active_persona = persona_name
+        self.system_prompt = self.personas[persona_name]
+        self.persona_workflows.setdefault(
+            persona_name,
+            DEFAULT_PERSONA_WORKFLOWS.get(persona_name, DEFAULT_WORKFLOW_NAME),
+        )
+        self.workflow_runner = self.build_workflow_runner_for_persona(persona_name)
+        self.save_persona_config()
+
+    def build_workflow_runner_for_persona(self, persona_name: str) -> workflows.WorkflowRunner:
+        workflow_name = self.persona_workflows.get(persona_name, DEFAULT_WORKFLOW_NAME)
+        workflow_path = self.resolve_workflow_path(workflow_name)
+
+        if workflow_path is None:
+            return workflows.WorkflowRunner.default(app=self)
+
+        try:
+            return workflows.WorkflowRunner.from_file(app=self, path=workflow_path)
+        except Exception as error:
+            self.print_error(f"Could not load workflow '{workflow_name}' for persona '{persona_name}': {error}")
+            self.print_dim("Falling back to built-in default workflow.")
+            return workflows.WorkflowRunner.default(app=self)
+
+    def resolve_workflow_path(self, workflow_name: str) -> Path | None:
+        workflow_name = (workflow_name or DEFAULT_WORKFLOW_NAME).strip()
+
+        if workflow_name == DEFAULT_WORKFLOW_NAME:
+            if DEFAULT_WORKFLOW_PATH.exists():
+                return DEFAULT_WORKFLOW_PATH
+            return None
+
+        candidate = Path(workflow_name).expanduser()
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+        if not workflow_name.endswith(".md"):
+            workflow_name = f"{workflow_name}.md"
+
+        user_workflow_path = USER_WORKFLOWS_DIR / workflow_name
+        if user_workflow_path.exists():
+            return user_workflow_path
+
+        project_workflow_path = PROJECT_WORKFLOWS_DIR / workflow_name
+        if project_workflow_path.exists():
+            return project_workflow_path
+
+        return None
+
+    def list_available_workflows(self) -> list[tuple[str, str]]:
+        workflows: list[tuple[str, str]] = [(DEFAULT_WORKFLOW_NAME, "default")]
+
+        seen_names = {DEFAULT_WORKFLOW_NAME}
+
+        for folder, source_label in (
+                (PROJECT_WORKFLOWS_DIR, "project"),
+                (USER_WORKFLOWS_DIR, "user"),
+        ):
+            if not folder.exists():
+                continue
+
+            for path in sorted(folder.glob("*.md")):
+                workflow_name = path.stem
+                if workflow_name in seen_names:
+                    continue
+
+                seen_names.add(workflow_name)
+                workflows.append((workflow_name, f"{workflow_name} ({source_label})"))
+
+        return workflows
+
+    def select_workflow_name(
+            self,
+            title: str,
+            current_workflow: str = DEFAULT_WORKFLOW_NAME,
+    ) -> str:
+        workflows = self.list_available_workflows()
+        workflow_names = [name for name, _label in workflows]
+        selected_workflow = current_workflow if current_workflow in workflow_names else DEFAULT_WORKFLOW_NAME
+        confirmed = False
+
+        radio_list = RadioList(
+            values=[(name, label) for name, label in workflows],
+            default=selected_workflow,
+        )
+
+        def confirm() -> None:
+            nonlocal selected_workflow, confirmed
+            selected_workflow = radio_list.current_value
+            confirmed = True
+            application.exit()
+
+        def cancel() -> None:
+            nonlocal confirmed
+            confirmed = False
+            application.exit()
+
+        dialog = Dialog(
+            title=title,
+            body=HSplit([
+                Label(text="Use ↑/↓ to choose the workflow for this persona."),
+                Box(body=radio_list, padding=1),
+            ]),
+            buttons=[
+                Button(text="Select", handler=confirm),
+                Button(text="Cancel", handler=cancel),
+            ],
+            with_background=False,
+        )
+
+        application = Application(
+            layout=Layout(dialog),
+            full_screen=False,
+            style=self.build_web_dialog_style(),
+        )
+
+        print()
+        with patch_stdout(raw=True):
+            application.run()
+        print()
+
+        if not confirmed:
+            return current_workflow or DEFAULT_WORKFLOW_NAME
+
+        return selected_workflow
+
+    def install_workflow_and_create_persona(self, workflow_path_text: str) -> None:
+        workflow_path_text = workflow_path_text.strip()
+
+        if not workflow_path_text:
+            print()
+            self.print_error("Usage: /workflow-install <path-to-workflow.md>")
+            print()
+            return
+
+        workflow_path = Path(workflow_path_text).expanduser()
+
+        try:
+            workflow_name = workflows.install_workflow_file(
+                source_path=workflow_path,
+                destination_dir=USER_WORKFLOWS_DIR,
+            )
+        except Exception as error:
+            print()
+            self.print_error(f"Could not install workflow: {error}")
+            print()
+            return
+
+        print()
+        self.print_info(f"Installed workflow: {workflow_name}")
+        self.print_dim(f"Saved to: {USER_WORKFLOWS_DIR / f'{workflow_name}.md'}")
+        print()
+
+        persona_name = self.session.prompt("New persona name for this workflow: ").strip()
+
+        if not persona_name:
+            self.print_dim("Persona creation cancelled. Workflow was installed but not assigned.")
+            print()
+            return
+
+        if persona_name in self.personas:
+            self.print_error(f"Persona already exists: {persona_name}")
+            self.print_dim("Workflow was installed but not assigned.")
+            print()
+            return
+
+        persona_prompt = self.prompt_persona_text(
+            prompt_title=f"New persona prompt for workflow: {workflow_name}",
+        )
+
+        if not persona_prompt:
+            self.print_dim("Persona creation cancelled. Workflow was installed but not assigned.")
+            print()
+            return
+
+        self.personas[persona_name] = persona_prompt
+        self.persona_workflows[persona_name] = workflow_name
+        self.set_active_persona(persona_name)
+
+        self.print_info(f"Added and activated persona: {persona_name}")
+        self.print_info(f"Assigned workflow: {workflow_name}")
+        print()
 
     # -----------------------------
     # App lifecycle
@@ -332,6 +804,7 @@ class SimpleAgentTUI(TuiFormatter):
             return
 
         self.refresh_model_context_lengths()
+        self.print_info(f"Workspace: {self.project_dir}")
         self.print_info("Connected to Ollama.")
         self.print_info(f"Model: {self.model}{self.format_num_context(self.model_num_context)}")
         self.print_info(f"Embedding: {self.embedding_model}{self.format_num_context(self.embedding_model_num_context)}")
@@ -359,33 +832,55 @@ class SimpleAgentTUI(TuiFormatter):
                 continue
 
             with patch_stdout(raw=True):
+                self.refresh_changed_attachments_before_prompt()
                 self.chat(user_input)
 
-        self.print_dim("\nGoodbye. Keep building. 小步快跑.\n")
+        self.print_dim("\nGoodbye. Keep building.\n")
 
     # -----------------------------
     # Chat
     # -----------------------------
 
+    def run_chat_model_for_workflow(self, chat_messages: list[dict[str, str]]) -> str:
+        """
+        Run one workflow model prompt and return the full raw reply.
+
+        Multi-prompt workflows call this once per prompt. Each call starts its own
+        loading toolbar because stream_chat_reply() stops the toolbar when that
+        individual model response completes.
+        """
+        self.start_loading_toolbar()
+        return self.stream_chat_reply(chat_messages)
+
     def chat(self, user_input: str) -> None:
-        self.messages.append({"role": "user", "content": user_input})
+        # Build prompt messages before adding the latest user prompt to history.
+        # The active workflow .md controls whether and where the original user
+        # prompt is inserted via `add_original_user_prompt`.
         self.compact_messages()
 
-        chat_messages = self.build_chat_messages(user_input)
         started_at = time.perf_counter()
-        tokens_in = self.estimate_chat_tokens(chat_messages)
 
         print()
         self.print_agent_header()
         self.start_loading_toolbar()
 
         try:
-            raw_reply = self.stream_chat_reply(chat_messages)
+            workflow_result = self.workflow_runner.run(
+                original_user_prompt=user_input,
+                execute_model=True,
+            )
             elapsed_seconds = time.perf_counter() - started_at
+
+            self.last_workflow_messages = self.flatten_workflow_debug_messages(workflow_result)
+
+            raw_reply = self.get_final_workflow_reply(workflow_result)
+
+            tokens_in = self.estimate_chat_tokens(workflow_result.messages)
             tokens_out = self.estimate_text_tokens(raw_reply)
             assistant_reply = self.extract_and_store_thinking(raw_reply)
             self.last_visible_reply = assistant_reply
 
+            self.messages.append({"role": "user", "content": user_input})
             self.messages.append(
                 {"role": "assistant", "content": assistant_reply}
             )
@@ -396,56 +891,86 @@ class SimpleAgentTUI(TuiFormatter):
             self.is_streaming_response = False
             self.stop_loading_toolbar()
             self.print_error(f"Model call failed: {exc}")
-            self.messages.pop()
+
+
+    def get_final_workflow_reply(self, workflow_result) -> str:
+        """
+        Return the workflow output that should be stored as the final reply.
+
+        Workflow prompts may stream directly to the terminal. This method selects
+        the final text for `/code`, memory, and stats without forcing `chat()` to
+        print the same text again.
+        """
+        prompt_results = getattr(workflow_result, "prompt_results", {}) or {}
+
+        if isinstance(prompt_results, dict) and prompt_results:
+            ordered_results = list(prompt_results.items())
+            preferred_results: list[tuple[str, object]] = []
+
+            if "output" in prompt_results:
+                preferred_results.append(("output", prompt_results["output"]))
+
+            preferred_results.extend(
+                (name, result)
+                for name, result in reversed(ordered_results)
+                if name != "output"
+            )
+
+            for _name, prompt_result in preferred_results:
+                raw_output = str(getattr(prompt_result, "raw_output", "") or "").strip()
+                if self.has_visible_model_output(raw_output):
+                    return raw_output
+
+        visible_output = str(getattr(workflow_result, "visible_output", "") or "").strip()
+        if self.has_visible_model_output(visible_output):
+            return visible_output
+
+        return ""
+
+    def has_visible_model_output(self, raw_output: str) -> bool:
+        visible_output = THINK_BLOCK_PATTERN.sub("", raw_output or "").strip()
+        return bool(visible_output)
+
+
+    def flatten_workflow_debug_messages(self, workflow_result) -> list[dict[str, str]]:
+        def normalise_debug_message(message: object) -> dict[str, str]:
+            if not isinstance(message, dict):
+                return {"role": "system", "content": str(message)}
+
+            role = str(message.get("role") or "system")
+            content = str(message.get("content") or "")
+            return {"role": role, "content": content}
+
+        def normalise_debug_messages(messages: object) -> list[dict[str, str]]:
+            if not isinstance(messages, list):
+                return []
+
+            return [normalise_debug_message(message) for message in messages]
+
+        debug_messages: list[dict[str, str]] = []
+        prompt_results = getattr(workflow_result, "prompt_results", {}) or {}
+
+        if not isinstance(prompt_results, dict) or not prompt_results:
+            return normalise_debug_messages(getattr(workflow_result, "messages", []))
+
+        for prompt_name, prompt_result in prompt_results.items():
+            debug_messages.append(
+                {
+                    "role": "system",
+                    "content": f"--- workflow prompt: {prompt_name} ---",
+                }
+            )
+            debug_messages.extend(
+                normalise_debug_messages(getattr(prompt_result, "messages", []))
+            )
+
+        return debug_messages
 
     def build_chat_messages(self, user_input: str) -> list[dict[str, str]]:
-        chat_messages = [
-            {"role": "system", "content": self.build_system_prompt()},
-        ]
-
-        relevant_memory = self.get_relevant_memory_context(user_input)
-        if relevant_memory:
-            chat_messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "Compacted older conversation context selected by embeddings. "
-                        "Treat this as background memory. The latest user message below is higher priority.\n\n"
-                        f"{relevant_memory}"
-                    ),
-                }
-            )
-
-        attachment_context = self.get_attachment_context(user_input)
-        if attachment_context:
-            chat_messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "Attachment context. Text/table/document attachments were selected by embeddings. "
-                        "Text-like attachments include both full source text and ranked embedding chunks. "
-                        "Image attachments are included in full because visual descriptions should not be ranked away. "
-                        "The latest user message is still the main task.\n\n"
-                        f"Attachment context:\n{attachment_context}"
-                    ),
-                }
-            )
-
-        web_context = self.get_relevant_web_context(user_input)
-        if web_context:
-            chat_messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "Web context selected by embeddings from pages loaded with /web. "
-                        "Use this only when relevant to the latest user message. "
-                        "The latest user message is still the main task.\n\n"
-                        f"Web context:\n{web_context}"
-                    ),
-                }
-            )
-
-        chat_messages.extend(self.messages[-MAX_RECENT_MESSAGES:])
+        chat_messages = self.workflow_runner.build_messages(
+            original_user_prompt=user_input,
+        )
+        self.last_workflow_messages = [dict(message) for message in chat_messages]
         return chat_messages
 
     def compact_messages(self) -> None:
@@ -801,6 +1326,422 @@ class SimpleAgentTUI(TuiFormatter):
                 + "\n\n[Attachment context truncated to fit token budget.]"
         )
 
+    def open_persona_manager(self) -> None:
+        while True:
+            action = self.select_persona_action()
+
+            if action == "close":
+                return
+
+            if action == "select":
+                persona_name = self.select_persona_name("Select persona")
+                if persona_name:
+                    self.set_active_persona(persona_name)
+                    self.print_info(f"Active persona set to: {persona_name}")
+                    print()
+                return
+
+            if action == "edit":
+                persona_name = self.select_persona_name("Edit persona")
+                if persona_name:
+                    self.edit_persona(persona_name)
+                return
+
+            if action == "add":
+                self.add_persona()
+                return
+
+            if action == "delete":
+                persona_name = self.select_persona_name("Delete persona")
+                if persona_name:
+                    self.delete_persona(persona_name)
+                return
+
+    def select_persona_action(self) -> str:
+        actions = [
+            ("select", "Select"),
+            ("edit", "Edit"),
+            ("add", "Add"),
+            ("delete", "Delete"),
+            ("close", "Close"),
+        ]
+
+        selected_action = "close"
+
+        def choose(action: str) -> None:
+            nonlocal selected_action
+            selected_action = action
+            application.exit()
+
+        dialog = Dialog(
+            title="Persona Manager",
+            body=HSplit(
+                [
+                    Label(text="Choose what you want to do with your SimpleAgent personas."),
+                    Label(text=f"Active persona: {self.active_persona}"),
+                ]
+            ),
+            buttons=[
+                Button(text=label, handler=lambda action=action: choose(action))
+                for action, label in actions
+            ],
+            with_background=False,
+        )
+
+        application = Application(
+            layout=Layout(dialog),
+            full_screen=False,
+            style=self.build_web_dialog_style(),
+        )
+
+        print()
+        with patch_stdout(raw=True):
+            application.run()
+        print()
+
+        return selected_action
+
+    def select_persona_name(self, title: str) -> str | None:
+        if not self.personas:
+            return None
+
+        persona_names = list(self.personas)
+        selected_name = self.active_persona if self.active_persona in self.personas else persona_names[0]
+        confirmed = False
+
+        values = [
+            (
+                name,
+                f"{name}"
+                f"{'  [built-in]' if name in BUILT_IN_PERSONA_NAMES else ''}"
+                f"{'  [active]' if name == self.active_persona else ''}"
+                f"  [workflow: {self.persona_workflows.get(name, DEFAULT_WORKFLOW_NAME)}]",
+            )
+            for name in persona_names
+        ]
+
+        radio_list = RadioList(
+            values=values,
+            default=selected_name,
+        )
+
+        def confirm() -> None:
+            nonlocal selected_name, confirmed
+            selected_name = radio_list.current_value
+            confirmed = True
+            application.exit()
+
+        def cancel() -> None:
+            nonlocal confirmed
+            confirmed = False
+            application.exit()
+
+        dialog = Dialog(
+            title=title,
+            body=HSplit([
+                Label(text="Use ↑/↓ to move, Tab to focus buttons, Enter to confirm."),
+                Box(body=radio_list, padding=1),
+            ]),
+            buttons=[
+                Button(text="Select", handler=confirm),
+                Button(text="Cancel", handler=cancel),
+            ],
+            with_background=False,
+        )
+
+        application = Application(
+            layout=Layout(dialog),
+            full_screen=False,
+            style=self.build_web_dialog_style(),
+        )
+
+        print()
+        with patch_stdout(raw=True):
+            application.run()
+        print()
+
+        if not confirmed:
+            return None
+
+        return selected_name
+
+    def prompt_persona_text(self, prompt_title: str, default_text: str = "") -> str:
+        print()
+        self.print_dim(prompt_title)
+        self.print_dim(
+            "Enter text. Finish with /done. Use /default or /default-coding to restore built-in prompts. Cancel with /cancel."
+        )
+
+        if default_text:
+            self.print_dim("Current text:")
+            print(default_text)
+            self.print_dim("---")
+
+        lines: list[str] = []
+
+        while True:
+            line = self.session.prompt("persona> ")
+
+            command = line.strip()
+
+            if command == "/cancel":
+                print()
+                return ""
+
+            if command == "/default":
+                print()
+                return DEFAULT_PERSONA_PROMPT.strip()
+
+            if command == "/default-coding":
+                print()
+                return DEFAULT_CODING_PERSONA_PROMPT.strip()
+
+            if command == "/done":
+                print()
+                return "\n".join(lines).strip()
+
+            lines.append(line)
+
+    def add_persona(self) -> None:
+        print()
+        persona_name = self.session.prompt("New persona name: ").strip()
+
+        if not persona_name:
+            self.print_dim("Persona creation cancelled.")
+            print()
+            return
+
+        if persona_name in self.personas:
+            self.print_error(f"Persona already exists: {persona_name}")
+            print()
+            return
+
+        persona_prompt = self.prompt_persona_text("New persona prompt")
+
+        if not persona_prompt:
+            self.print_dim("Persona creation cancelled.")
+            print()
+            return
+
+        workflow_name = self.select_workflow_name(
+            title=f"Workflow for persona: {persona_name}",
+            current_workflow=DEFAULT_WORKFLOW_NAME,
+        )
+
+        self.personas[persona_name] = persona_prompt
+        self.persona_workflows[persona_name] = workflow_name
+        self.set_active_persona(persona_name)
+        self.print_info(f"Added and activated persona: {persona_name}")
+        print()
+
+    def edit_persona(self, persona_name: str) -> None:
+        existing_prompt = self.personas.get(persona_name, "")
+        if persona_name in BUILT_IN_PERSONA_NAMES:
+            self.print_dim(f"Existing prompt: {existing_prompt}")
+            self.print_error(f"Built-in persona cannot be edited: {persona_name}")
+            self.print_dim("Create a custom persona if you want to modify it.")
+            print()
+            return
+
+        updated_prompt = self.prompt_persona_text(
+            prompt_title=f"Editing persona: {persona_name}",
+            default_text=existing_prompt,
+        )
+
+        if not updated_prompt:
+            self.print_dim("Persona edit cancelled.")
+            print()
+            return
+
+        workflow_name = self.select_workflow_name(
+            title=f"Workflow for persona: {persona_name}",
+            current_workflow=self.persona_workflows.get(persona_name, DEFAULT_WORKFLOW_NAME),
+        )
+
+        self.personas[persona_name] = updated_prompt
+        self.persona_workflows[persona_name] = workflow_name
+
+        if persona_name == self.active_persona:
+            self.system_prompt = updated_prompt
+            self.workflow_runner = self.build_workflow_runner_for_persona(persona_name)
+
+        self.save_persona_config()
+        self.print_info(f"Updated persona: {persona_name}")
+        print()
+
+    def delete_persona(self, persona_name: str) -> None:
+        if persona_name in BUILT_IN_PERSONA_NAMES:
+            self.print_error(f"Built-in persona cannot be deleted: {persona_name}")
+            print()
+            return
+
+        if persona_name not in self.personas:
+            self.print_error(f"Persona not found: {persona_name}")
+            print()
+            return
+
+        if len(self.personas) <= 1:
+            self.print_error("Cannot delete the only persona.")
+            print()
+            return
+
+        confirmed = self.confirm_persona_delete(persona_name)
+
+        if not confirmed:
+            self.print_dim("Persona deletion cancelled.")
+            print()
+            return
+
+        del self.personas[persona_name]
+        self.persona_workflows.pop(persona_name, None)
+
+        if "Default" not in self.personas:
+            self.personas["Default"] = DEFAULT_PERSONA_PROMPT
+
+        if self.active_persona == persona_name:
+            self.active_persona = (
+                "Default"
+                if "Default" in self.personas
+                else next(iter(self.personas))
+            )
+            self.system_prompt = self.personas[self.active_persona]
+
+        self.save_persona_config()
+        self.print_info(f"Deleted persona: {persona_name}")
+        self.print_info(f"Active persona: {self.active_persona}")
+        print()
+
+    def confirm_persona_delete(self, persona_name: str) -> bool:
+        confirmed = False
+
+        def confirm() -> None:
+            nonlocal confirmed
+            confirmed = True
+            application.exit()
+
+        def cancel() -> None:
+            nonlocal confirmed
+            confirmed = False
+            application.exit()
+
+        dialog = Dialog(
+            title="Delete persona",
+            body=Label(text=f"Delete persona '{persona_name}'? This cannot be undone."),
+            buttons=[
+                Button(text="Delete", handler=confirm),
+                Button(text="Cancel", handler=cancel),
+            ],
+            with_background=False,
+        )
+
+        application = Application(
+            layout=Layout(dialog),
+            full_screen=False,
+            style=self.build_web_dialog_style(),
+        )
+
+        print()
+        with patch_stdout(raw=True):
+            application.run()
+        print()
+
+        return confirmed
+
+    def build_web_dialog_style(self) -> Style:
+        """
+        Return prompt_toolkit styling for the web-result selector dialog.
+        """
+        return Style.from_dict(
+            {
+                "dialog": "bg:#101827 #d7e7ff",
+                "dialog frame.label": "bg:#101827 #60a5fa bold",
+                "dialog.body": "bg:#101827 #d7e7ff",
+                "dialog shadow": "bg:#050814",
+
+                "checkbox": "bg:#101827 #d7e7ff",
+                "checkbox-selected": "bg:#101827 #60a5fa bold",
+                "checkbox-checked": "bg:#101827 #22c55e bold",
+                "checkbox-checked-selected": "bg:#1d4ed8 #ffffff bold",
+
+                "button": "bg:#1e293b #d7e7ff",
+                "button.focused": "bg:#2563eb #ffffff bold",
+                "label": "bg:#101827 #93c5fd",
+            }
+        )
+
+    def select_web_search_results(self, results: list[dict]) -> list[dict]:
+        if not results:
+            return []
+
+        selected_indexes = list(range(len(results)))
+        confirmed = False
+
+        def build_label(index: int, result: dict) -> str:
+            title = str(result.get("title") or result.get("label") or "Untitled result").strip()
+            url = str(result.get("url") or result.get("href") or "").strip()
+
+            if hasattr(self, "clip_text"):
+                title = self.clip_text(title, 72)
+                url = self.clip_text(url, 92)
+
+            return f"{index + 1:02d}. {title}\n    {url}"
+
+        checkbox = CheckboxList(
+            values=[
+                (index, build_label(index, result))
+                for index, result in enumerate(results)
+            ],
+            default_values=selected_indexes,
+        )
+
+        def confirm() -> None:
+            nonlocal selected_indexes, confirmed
+            selected_indexes = list(checkbox.current_values)
+            confirmed = True
+            application.exit()
+
+        def cancel() -> None:
+            nonlocal selected_indexes, confirmed
+            selected_indexes = []
+            confirmed = False
+            application.exit()
+
+        dialog = Dialog(
+            title="Select web results to scrape",
+            body=HSplit(
+                [
+                    Label(text="Use Space to toggle results, Tab to move, Enter to confirm."),
+                    Box(body=checkbox, padding=1),
+                ]
+            ),
+            buttons=[
+                Button(text="Confirm", handler=confirm),
+                Button(text="Cancel", handler=cancel),
+            ],
+            with_background=False,
+        )
+
+        application = Application(
+            layout=Layout(dialog),
+            full_screen=False,
+            style=self.build_web_dialog_style(),
+        )
+
+        print()
+        with patch_stdout(raw=True):
+            application.run()
+        print()
+
+        if not confirmed:
+            return []
+
+        selected_index_set = set(selected_indexes)
+        return [
+            result
+            for index, result in enumerate(results)
+            if index in selected_index_set
+        ]
+
     def add_web_context(self, target: str) -> bool:
         """
         Load a URL or search query into embedded web context.
@@ -839,14 +1780,38 @@ class SimpleAgentTUI(TuiFormatter):
         self.print_dim(f"Searching DuckDuckGo: {target}")
 
         try:
-            embedded_items = utils.duckduckgo_search_to_embedded_context_items(
-                client=self.client,
+            search_results = utils.duckduckgo_search_results(
                 query=target,
-                model=self.embedding_model,
-                max_results=5,
+                max_results=10,
             )
         except Exception as error:
             self.print_error(f"Could not search web for '{target}': {error}")
+            print()
+            return False
+
+        if not search_results:
+            self.print_error(f"No DuckDuckGo results found for: {target}")
+            print()
+            return False
+
+        search_results = self.select_web_search_results(search_results)
+
+        if not search_results:
+            self.print_dim("No web results selected.")
+            print()
+            return False
+
+        self.print_info(f"Scraping {len(search_results)} selected web result(s)...")
+
+        try:
+            embedded_items = utils.duckduckgo_search_results_to_embedded_context_items(
+                client=self.client,
+                query=target,
+                model=self.embedding_model,
+                search_results=search_results,
+            )
+        except Exception as error:
+            self.print_error(f"Could not scrape selected web results for '{target}': {error}")
             print()
             return False
 
@@ -1171,7 +2136,7 @@ class SimpleAgentTUI(TuiFormatter):
         self.print_tui_markdown(reply)
         self.streaming_reply_buffer = ""
 
-    def stream_chat_reply(self, chat_messages: list[dict[str, str]]) -> str:
+    def stream_chat_reply(self, chat_messages: list[dict[str, str]], print_stream: bool = True) -> str:
         thinking_text = ""
         reply_text = ""
         self.reset_streaming_reply_buffer()
@@ -1447,6 +2412,7 @@ class SimpleAgentTUI(TuiFormatter):
 
         self.clear_screen()
         self.show_landing_page()
+        self.print_info(f"Workspace: {self.project_dir}")
         self.print_info("Connected to Ollama.")
         self.print_info(f"Model: {self.model}{self.format_num_context(self.model_num_context)}")
         self.print_info(f"Embedding: {self.embedding_model}{self.format_num_context(self.embedding_model_num_context)}")
@@ -1471,6 +2437,11 @@ class SimpleAgentTUI(TuiFormatter):
 
         if command in {"/exit", "/quit", "/q"}:
             return False
+
+        if command == "/code":
+            with patch_stdout(raw=True):
+                self.review_last_code_blocks()
+            return True
 
         if command == "/help":
             with patch_stdout(raw=True):
@@ -1559,29 +2530,32 @@ class SimpleAgentTUI(TuiFormatter):
             self.select_embedding_model()
             return True
 
-        if command == "/system":
-            if not arg:
-                print("\nCurrent system prompt:\n")
-                print(self.system_prompt)
-                print()
-                return True
-
-            self.system_prompt = arg.strip()
-            self.config["system_prompt"] = self.system_prompt
-            save_config(self.config)
-            self.print_info("System prompt updated and saved.")
-            return True
-
-        if command == "/system-reset":
-            self.system_prompt = DEFAULT_SYSTEM_PROMPT
-            self.config.pop("system_prompt", None)
-            save_config(self.config)
-            self.print_info("System prompt reset and saved.")
+        if command == "/persona":
+            self.open_persona_manager()
             return True
 
         if command == "/history":
             with patch_stdout(raw=True):
                 self.show_history()
+            return True
+
+        if command == "/workflow":
+            with patch_stdout(raw=True):
+                self.show_workflow_help()
+            return True
+
+        if command == "/workflow-install":
+            with patch_stdout(raw=True):
+                self.install_workflow_and_create_persona(arg)
+            return True
+
+        if command == "/workflow-debug":
+            with patch_stdout(raw=True):
+                self.show_workflow_debug()
+            return True
+
+        if command == "/markup":
+            self.toggle_agent_reply_markup()
             return True
 
         if command == "/clear":
@@ -1594,6 +2568,7 @@ class SimpleAgentTUI(TuiFormatter):
             self.web_context_items.clear()
             self.web_sources.clear()
             self.web_index.clear()
+            self.last_workflow_messages.clear()
             self.last_thinking = ""
             self.last_visible_reply = ""
             self.show_thinking = False
@@ -1608,6 +2583,7 @@ class SimpleAgentTUI(TuiFormatter):
             with patch_stdout(raw=True):
                 self.clear_screen()
                 self.show_landing_page()
+                self.print_info(f"Workspace: {self.project_dir}")
                 self.print_info("Connected to Ollama.")
                 self.print_info(f"Model: {self.model}{self.format_num_context(self.model_num_context)}")
                 self.print_info(f"Embedding: {self.embedding_model}{self.format_num_context(self.embedding_model_num_context)}")
@@ -1661,7 +2637,6 @@ class SimpleAgentTUI(TuiFormatter):
 
         paths = self.parse_attachment_paths(arg)
         if not paths:
-            print()
             self.print_error("Could not parse attachment path.")
             print()
             return
@@ -1672,7 +2647,6 @@ class SimpleAgentTUI(TuiFormatter):
                 added_count += 1
 
         if added_count:
-            print()
             self.print_info(f"Attached {added_count} file(s).")
             print()
             self.session.app.invalidate()
@@ -1681,7 +2655,6 @@ class SimpleAgentTUI(TuiFormatter):
         try:
             parts = shlex.split(raw_paths)
         except ValueError as error:
-            print()
             self.print_error(f"Could not parse paths: {error}")
             print()
             return []
@@ -1692,19 +2665,16 @@ class SimpleAgentTUI(TuiFormatter):
         path = path.expanduser()
 
         if not path.exists():
-            print()
             self.print_error(f"Attachment not found: {path}")
             print()
             return False
 
         if not path.is_file():
-            print()
             self.print_error(f"Attachment is not a file: {path}")
             print()
             return False
 
         if not self.is_supported_attachment(path):
-            print()
             self.print_error(f"Unsupported attachment type: {path.name}")
             self.print_dim("Supported: text/code files, images .png/.jpg/.jpeg, PDF, CSV/TSV, Excel .xls/.xlsx")
             print()
@@ -1712,7 +2682,6 @@ class SimpleAgentTUI(TuiFormatter):
 
         resolved_path = str(path.resolve())
         if any(item.get("source_path") == resolved_path for item in self.attachments):
-            print()
             self.print_dim(f"Already attached: {path.name}")
             print()
             return False
@@ -1727,12 +2696,110 @@ class SimpleAgentTUI(TuiFormatter):
             "filename": path.name,
             "extension": path.suffix.lower(),
             "mime_type": mime_type or "application/octet-stream",
+            "sha256": utils.calculate_file_sha256(path),
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
         self.attachments.append(attachment)
         self.store_attachment_context_items(embedded_context_items)
         self.store_full_text_attachment_context(path)
         return True
+
+    def refresh_changed_attachments_before_prompt(self) -> None:
+        """
+        Re-read and re-embed attached files if their SHA-256 changed since attachment.
+
+        This keeps attachment context fresh when the user edits a file outside the app
+        before sending the next prompt.
+        """
+        if not self.attachments:
+            return
+
+        changed_attachments: list[dict[str, str]] = []
+
+        for attachment in self.attachments:
+            source_path = attachment.get("source_path", "")
+            stored_sha256 = attachment.get("sha256", "")
+
+            if not source_path or not stored_sha256:
+                continue
+
+            path = Path(source_path)
+            if not path.exists() or not path.is_file():
+                self.print_error(f"Attached file is no longer available: {path}")
+                continue
+
+            try:
+                current_sha256 = utils.calculate_file_sha256(path)
+            except Exception as error:
+                self.print_error(f"Could not check attachment hash for {path.name}: {error}")
+                continue
+
+            if current_sha256 != stored_sha256:
+                changed_attachments.append(attachment)
+
+        if not changed_attachments:
+            return
+
+        changed_names = ", ".join(item.get("filename", "attachment") for item in changed_attachments)
+        print()
+        self.print_dim(f"Detected changed attachment(s): {changed_names}")
+        self.print_dim("Refreshing attachment context before processing prompt...")
+
+        self.rebuild_attachment_contexts()
+
+    def rebuild_attachment_contexts(self) -> None:
+        """
+        Rebuild all attachment contexts and vector indexes from the current attachment list.
+
+        Rebuilding all attachments is simpler and safer than trying to surgically remove
+        old chunks from the vector index, because VectorMemoryIndex is append-oriented.
+        """
+        current_attachments = list(self.attachments)
+
+        self.attachment_context_items.clear()
+        self.image_attachment_context_items.clear()
+        self.text_attachment_full_context_items.clear()
+        self.attachment_index.clear()
+
+        refreshed_attachments: list[dict[str, str]] = []
+
+        for attachment in current_attachments:
+            source_path = attachment.get("source_path", "")
+            if not source_path:
+                continue
+
+            path = Path(source_path)
+            if not path.exists() or not path.is_file():
+                self.print_error(f"Skipping missing attachment during refresh: {source_path}")
+                continue
+
+            embedded_context_items = self.embed_attachment(path)
+            if not embedded_context_items:
+                self.print_error(f"Skipping unreadable attachment during refresh: {path.name}")
+                continue
+
+            mime_type, _ = mimetypes.guess_type(str(path.resolve()))
+            refreshed_attachment = dict(attachment)
+            refreshed_attachment.update(
+                {
+                    "source_path": str(path.resolve()),
+                    "filename": path.name,
+                    "extension": path.suffix.lower(),
+                    "mime_type": mime_type or "application/octet-stream",
+                    "sha256": utils.calculate_file_sha256(path),
+                    "refreshed_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+
+            refreshed_attachments.append(refreshed_attachment)
+            self.store_attachment_context_items(embedded_context_items)
+            self.store_full_text_attachment_context(path)
+
+        self.attachments = refreshed_attachments
+
+        self.print_info(f"Attachment context refreshed for {len(self.attachments)} file(s).")
+        print()
+        self.session.app.invalidate()
 
     def embed_attachment(self, path: Path) -> list[dict]:
         """
@@ -1829,20 +2896,17 @@ class SimpleAgentTUI(TuiFormatter):
         pasted_text = self.read_clipboard_text()
         if pasted_text:
             self.next_input_prefill = pasted_text
-            print()
             self.print_info("Clipboard text loaded into the next prompt.")
             print()
             return
 
         image_path = self.save_clipboard_image()
         if image_path and self.add_attachment(image_path):
-            print()
             self.print_info(f"Clipboard image attached: {image_path.name}")
             print()
             self.session.app.invalidate()
             return
 
-        print()
         self.print_error("Clipboard does not contain supported text or image data.")
         print()
 
@@ -1875,6 +2939,7 @@ class SimpleAgentTUI(TuiFormatter):
 
         self.print_dim("Image clipboard paste currently supports macOS/Windows with Pillow.")
         self.print_dim("Install it with: pip install pillow")
+        print()
         return None
 
     def save_clipboard_image_macos(self) -> Path | None:
@@ -1884,7 +2949,6 @@ class SimpleAgentTUI(TuiFormatter):
         try:
             clipboard_data = ImageGrab.grabclipboard()
         except Exception as error:
-            print()
             self.print_error(f"Could not read clipboard image: {error}")
             print()
             return None
@@ -1907,7 +2971,6 @@ class SimpleAgentTUI(TuiFormatter):
         try:
             clipboard_data.save(output_path, "PNG")
         except Exception as error:
-            print()
             self.print_error(f"Could not save clipboard image: {error}")
             print()
             return None
@@ -2106,6 +3169,60 @@ class SimpleAgentTUI(TuiFormatter):
             print(f"  {model}{self.format_num_context(num_context)}{marker_text}")
         print()
 
+    def show_workflow_help(self) -> None:
+        print()
+        print(self.bold("Workflow assignment"))
+        print(self.dim("Workflows are assigned per persona."))
+        print()
+
+        self.print_info("To choose a workflow for a new persona:")
+        self.print_dim("  /persona → Add → enter name → enter prompt → select workflow")
+        print()
+
+        self.print_info("To change a workflow for an existing custom persona:")
+        self.print_dim("  /persona → Edit → select persona → update prompt → select workflow")
+        print()
+
+        self.print_info("To install a workflow .md and create a persona for it:")
+        self.print_dim("  /workflow-install path/to/workflow.md")
+        print()
+
+        self.print_dim("Built-in personas cannot be edited. Create a custom persona if you want a different workflow.")
+        self.print_dim(f"Current persona: {self.active_persona}")
+        self.print_dim(f"Current workflow: {self.persona_workflows.get(self.active_persona, DEFAULT_WORKFLOW_NAME)}")
+        print()
+
+    def show_workflow_debug(self) -> None:
+        if not self.last_workflow_messages:
+            print()
+            self.print_dim("No workflow prompt has been built yet.")
+            self.print_dim("Send a normal prompt first, then run /workflow-debug.")
+            print()
+            return
+
+        print()
+        print(self.bold("Last workflow prompt messages"))
+        print(self.dim(f"Persona: {self.active_persona.lower()}"))
+        print(self.dim(f"Workflow: {self.persona_workflows.get(self.active_persona, DEFAULT_WORKFLOW_NAME)}"))
+        print(self.dim(f"Messages: {len(self.last_workflow_messages)}"))
+        print()
+
+        for index, message in enumerate(self.last_workflow_messages, start=1):
+            role = str(message.get("role") or "unknown")
+            content = str(message.get("content") or "")
+            token_estimate = self.estimate_text_tokens(content)
+
+            print(self.blue(f"[{index:02d}] {role} · ~{token_estimate:,} token(s)"))
+            print(self.dim("-" * 88))
+
+            if content:
+                print(content)
+            else:
+                self.print_dim("<empty>")
+
+            print(self.dim("-" * 88))
+            print()
+
     def show_history(self) -> None:
         if not self.messages and not self.memory_items:
             self.print_dim("No messages in this session yet.")
@@ -2161,9 +3278,16 @@ class SimpleAgentTUI(TuiFormatter):
                 f"<ansigreen> ◆ {self.escape_toolbar_html(line)} </ansigreen>"
             )
 
+        active_persona = self.escape_toolbar_html(getattr(self, "active_persona", "Default"))
+        active_workflow = self.escape_toolbar_html(
+            getattr(self, "persona_workflows", {}).get(
+                getattr(self, "active_persona", "Default"),
+                DEFAULT_WORKFLOW_NAME,
+            )
+        )
         toolbar_lines.append(
-            f"<ansiblue> @ {APP_NAME} </ansiblue> "
-            f"<ansigray>■ {self.escape_toolbar_html(self.model)} ■ vision {self.escape_toolbar_html(self.vision_model)} ■ type / for commands</ansigray>"
+            f"<ansiblue> @ persona: {active_persona.lower()} + workflow: {active_workflow.lower()} </ansiblue> "
+            f"<ansigray>■ {self.escape_toolbar_html(self.model)} ■ type / for commands</ansigray>"
         )
         return HTML("\n".join(toolbar_lines))
 

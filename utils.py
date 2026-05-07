@@ -1,5 +1,9 @@
 from __future__ import annotations
 from math import sqrt
+import hashlib
+from pathlib import Path
+import difflib
+import editblock
 import base64
 import urllib.error
 import urllib.request
@@ -53,6 +57,18 @@ except ImportError:  # pragma: no cover
     openpyxl = None
 
 T = TypeVar("T", bound=dict)
+
+
+def calculate_file_sha256(path: str | Path) -> str:
+    """
+    Calculate SHA-256 hash for a file.
+    """
+    file_path = Path(path).expanduser()
+    sha256 = hashlib.sha256()
+    with file_path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            sha256.update(chunk)
+    return sha256.hexdigest()
 
 
 # -----------------------------
@@ -221,6 +237,91 @@ def normalise_model_text_response(response: Any) -> str:
 
     return str(response)
 
+def review_and_apply_plain_code_blocks_from_llm_output(
+    llm_output: str,
+    title: str = "Full-file code diff review",
+) -> bool:
+    """
+    Deprecated shim — delegates to editblock.WholeFileEditor.
+
+    Older coder prompts sometimes emit file headers like:
+        File name:** `hello.py`
+        File contents:
+
+    The legacy whole-file parser can mistake those markdown labels for the path.
+    Normalise that common shape into a cleaner filename/code-fence format before
+    passing it into editblock.
+    """
+    app = getattr(review_and_apply_plain_code_blocks_from_llm_output, "app", None)
+    return editblock.apply_llm_edits(
+        app=app,
+        llm_output=normalise_llm_file_headers(llm_output),
+        strategy=editblock.EditStrategy.AUTO,
+        title=title,
+    )
+
+
+def normalise_llm_file_headers(llm_output: str) -> str:
+    """
+    Clean common markdown/prose file labels before whole-file edit parsing.
+
+    This keeps normal code blocks unchanged, but rewrites noisy labels such as
+    `File name:** `hello.py`` into `File: hello.py` so downstream diff review
+    can extract the intended path instead of the surrounding markdown.
+    """
+    if not llm_output:
+        return ""
+
+    lines = llm_output.splitlines()
+    normalised_lines: list[str] = []
+
+    for line in lines:
+        filename = extract_filename_from_llm_header(line)
+        if filename:
+            normalised_lines.append(f"File: {filename}")
+            continue
+
+        cleaned_line = line.strip().strip("*`")
+        if re.match(r"^\s*(file\s+contents?|contents?)\s*:\s*$", cleaned_line, flags=re.IGNORECASE):
+            continue
+
+        normalised_lines.append(line)
+
+    return "\n".join(normalised_lines).strip()
+
+
+def extract_filename_from_llm_header(line: str) -> str:
+    """
+    Extract a filename from simple LLM file headers.
+
+    Keep this intentionally small: remove markdown decoration, recognise labels
+    like `File name:` / `Filename:` / `File:`, then return the first plausible
+    path-looking token after the colon.
+    """
+    value = line.strip()
+    if not value:
+        return ""
+
+    value = value.strip("*` ")
+    value = re.sub(r"\*+", "", value)
+
+    match = re.match(
+        r"^file\s*(?:name|path)?\s*:\s*(?P<rest>.+)$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+
+    rest = match.group("rest").strip().strip("`'\"* ")
+    if not rest:
+        return ""
+
+    token_match = re.search(r"[^\s`'\"<>|]+\.[A-Za-z0-9_.-]+", rest)
+    if not token_match:
+        return ""
+
+    return token_match.group(0).strip("`'\"* ,:;")
 
 # -----------------------------
 # Embedding utilities
@@ -1627,32 +1728,33 @@ def scrape_url_to_embedded_context_items(
     )
     return vectorise_context_items(client, context_items, model)
 
-
-def duckduckgo_search_to_embedded_context_items(
-    client: Any,
+def duckduckgo_search_results(
     query: str,
-    model: str,
-    max_results: int = 5,
+    max_results: int = 10,
     timeout_ms: int = 30_000,
-    chunk_size: int = 1_200,
-    chunk_overlap: int = 180,
-) -> list[dict[str, Any]]:
+) -> list[dict[str, str]]:
     """
-    Search DuckDuckGo, scrape result pages, and return embedded context items.
-
-    This is intentionally structured data, unlike duckduckgo_search_and_scrape which
-    returns one printable string. Main.py can add these items to VectorMemoryIndex,
-    then search them against the user's prompt embedding.
+    Search DuckDuckGo and return normalised result records without scraping pages.
     """
-    search_results = _duckduckgo_search_results(
+    return _duckduckgo_search_results(
         query=query,
         max_results=max_results,
         timeout_ms=timeout_ms,
     )
 
-    if not search_results:
-        return []
 
+def duckduckgo_search_results_to_embedded_context_items(
+    client: Any,
+    query: str,
+    model: str,
+    search_results: Sequence[dict[str, str]],
+    timeout_ms: int = 30_000,
+    chunk_size: int = 1_200,
+    chunk_overlap: int = 180,
+) -> list[dict[str, Any]]:
+    """
+    Scrape selected DuckDuckGo result records and return embedded context items.
+    """
     embedded_items: list[dict[str, Any]] = []
 
     for result_index, result in enumerate(search_results, start=1):
@@ -1686,6 +1788,41 @@ def duckduckgo_search_to_embedded_context_items(
         embedded_items.extend(vectorise_context_items(client, context_items, model))
 
     return embedded_items
+
+def duckduckgo_search_to_embedded_context_items(
+    client: Any,
+    query: str,
+    model: str,
+    max_results: int = 10,
+    timeout_ms: int = 30_000,
+    chunk_size: int = 1_200,
+    chunk_overlap: int = 180,
+) -> list[dict[str, Any]]:
+    """
+    Search DuckDuckGo, scrape result pages, and return embedded context items.
+
+    This is intentionally structured data, unlike duckduckgo_search_and_scrape which
+    returns one printable string. Main.py can add these items to VectorMemoryIndex,
+    then search them against the user's prompt embedding.
+    """
+    search_results = _duckduckgo_search_results(
+        query=query,
+        max_results=max_results,
+        timeout_ms=timeout_ms,
+    )
+
+    if not search_results:
+        return []
+
+    return duckduckgo_search_results_to_embedded_context_items(
+        client=client,
+        query=query,
+        model=model,
+        search_results=search_results,
+        timeout_ms=timeout_ms,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
 
 
 # -----------------------------
@@ -1855,7 +1992,7 @@ class DuckDuckGoHTMLParser(HTMLParser):
 
 def _duckduckgo_search_results(
     query: str,
-    max_results: int = 5,
+    max_results: int = 10,
     timeout_ms: int = 30_000,
 ) -> list[dict[str, str]]:
     """
