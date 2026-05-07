@@ -4,6 +4,8 @@
 
 **SimpleAgent** is a lightweight local AI coding agent built around a simple idea: small models can become useful when the surrounding system gives them strong structure, good context, safe patching, and human-in-the-loop review.
 
+Tested on Macbook Pro M2, 16GB RAM. This is made for users who wants to experience a local model with tool-like capabilities with their edge devices.
+
 > Work work. Ship ship. Poor man's Claude Code for tiny local models.
 
 ![screenshot](screenshots/formatting_2.png)
