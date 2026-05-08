@@ -6,8 +6,8 @@ build-backend = "hatchling.build"
 packages = ["."]
 
 [project]
-name = "simpleagent"
-version = "0.2.3"
+name = "weirenong-simpleagent"
+version = "0.2.5"
 description = "Tiny local AI agent for edge devices, built to make small models useful with workflows, personas, file/web context, and safe tool-like actions."
 readme = "README.md"
 requires-python = ">=3.10"
