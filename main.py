@@ -46,7 +46,7 @@ from utils import VectorMemoryIndex, vectorise_text
 
 from PIL import Image, ImageGrab
 
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 APP_NAME = "SimpleAgent"
 DEFAULT_MODEL = "nemotron-3-nano:4b"
 DEFAULT_EMBEDDING_MODEL = "ordis/jina-embeddings-v2-base-code:latest"
