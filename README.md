@@ -566,17 +566,25 @@ The TUI aims to make local model experimentation fast and inspectable.
 
 ## Installation
 
-1. Clone this repository:
+SimpleAgent is published on PyPI as:
 
-```bash
-git clone https://github.com/weirenong/simpleagent.git
-cd simpleagent
+```text
+weirenong-simpleagent
 ```
 
-2. Install Python dependencies:
+1. Install pipx
+
+If you do not already have pipx installed:
 
 ```bash
-pip install -r requirements.txt
+python -m pip install --user pipx
+python -m pipx ensurepath
+```
+
+2. Install SimpleAgent
+
+```bash
+pipx install weirenong-simpleagent
 ```
 
 3. Install and run Ollama:
@@ -596,7 +604,7 @@ ollama pull granite3.2-vision:2b
 5. Start SimpleAgent:
 
 ```bash
-python main.py
+simpleagent
 ```
 
 ---
