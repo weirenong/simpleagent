@@ -1195,7 +1195,7 @@ def apply_llm_edits(
 
     Parameters
     ----------
-    app      : the SimpleAgentTUI instance (needs .attachments)
+    app      : the simpleagent instance (needs .attachments)
     llm_output : the raw LLM response text
     strategy : which edit format to parse
     title    : label for the UI prompt

@@ -1,6 +1,6 @@
-prompt-toolkit>=3.0.52
-wcwidth>=0.7.0
-playwright>=1.59.0
+prompt-toolkit
+wcwidth
+playwright
 faiss-cpu
 numpy
 pillow
