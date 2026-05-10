@@ -74,7 +74,7 @@ DEFAULT_PERSONA_WORKFLOWS = {
     "Coding": "coding",
 }
 
-ATTACHMENTS_DIR = CONFIG_DIR / "attachments"
+TEMP_DIR = CONFIG_DIR / "temp"
 
 SUPPORTED_ATTACHMENT_EXTENSIONS = (
     utils.TEXT_ATTACHMENT_EXTENSIONS
@@ -91,7 +91,7 @@ COMMANDS = {
     "/web": "Load a URL or search and store ranked web context",
     "/paste": "Paste text or image from the clipboard",
     "/clear": "Clear current session history",
-    "/code": "Review/apply search & replace blocks from the last assistant reply",
+    "/code": "Stage, review, and apply code edits from the last assistant reply",
     "/workspace": "Reset workspace to terminal folder, or change it by path",
     "/model": "Show or change the Ollama chat model",
     "/embedding": "Show or change the Ollama embeddings model",
@@ -452,23 +452,11 @@ def save_config(config: dict) -> None:
 
 
 class SimpleAgentTUI(TuiFormatter):
-    def redraw_after_workspace_change(self, message: str) -> None:
-        print()
-        self.clear_screen()
-        self.show_landing_page()
-        self.print_info(f"Workspace: {self.workspace_dir}")
-        self.print_info("Connected to Ollama.")
-        self.print_info(f"Model: {self.model}{self.format_num_context(self.model_num_context)}")
-        self.print_info(f"Embedding: {self.embedding_model}{self.format_num_context(self.embedding_model_num_context)}")
-        self.print_info(f"Vision: {self.vision_model}{self.format_num_context(self.vision_model_num_context)}")
-        self.print_dim("Type /help for commands. F1 to collapse/expand thinking. Type /exit to quit.\n")
-        self.print_info(message)
-        self.print_dim("Saved to config.json.")
-        self.print_dim("Session history, memory, attachments, web context, and screen cleared.")
-        print()
     def __init__(self) -> None:
         self.config = load_config()
         self.workspace_dir = self.load_workspace_dir()
+        self.temp_dir = TEMP_DIR
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.model = os.getenv("SIMPLEAGENT_MODEL") or self.config.get("model", DEFAULT_MODEL)
         self.host = os.getenv("OLLAMA_HOST") or self.config.get("host", "http://localhost:11434")
         self.embedding_model = self.config.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
@@ -614,6 +602,21 @@ class SimpleAgentTUI(TuiFormatter):
         )
 
         self.install_resize_handler()
+
+    def redraw_after_workspace_change(self, message: str) -> None:
+        print()
+        self.clear_screen()
+        self.show_landing_page()
+        self.print_info(f"Workspace: {self.workspace_dir}")
+        self.print_info("Connected to Ollama.")
+        self.print_info(f"Model: {self.model}{self.format_num_context(self.model_num_context)}")
+        self.print_info(f"Embedding: {self.embedding_model}{self.format_num_context(self.embedding_model_num_context)}")
+        self.print_info(f"Vision: {self.vision_model}{self.format_num_context(self.vision_model_num_context)}")
+        self.print_dim("Type /help for commands. F1 to collapse/expand thinking. Type /exit to quit.\n")
+        self.print_info(message)
+        self.print_dim("Saved to config.json.")
+        self.print_dim("Session history, memory, attachments, web context, and screen cleared.")
+        print()
 
     def load_workspace_dir(self) -> Path:
         configured_workspace = str(self.config.get("workspace") or "").strip()
@@ -2712,22 +2715,22 @@ class SimpleAgentTUI(TuiFormatter):
         self.streaming_thinking_last_block = ""
         self.streaming_thinking_closed = True
         self.reset_streaming_reply_buffer()
-        self.delete_attachment_files()
+        self.delete_temp_files()
         self.attachments.clear()
         self.next_input_prefill = ""
 
     # -----------------------------
     # Attachments
     # -----------------------------
-    def delete_attachment_files(self) -> None:
+    def delete_temp_files(self) -> None:
         """
         Delete files saved inside the app attachment folder.
         Original files attached from elsewhere are not deleted unless they are inside ATTACHMENTS_DIR.
         """
-        if not ATTACHMENTS_DIR.exists():
+        if not TEMP_DIR.exists():
             return
 
-        for path in ATTACHMENTS_DIR.iterdir():
+        for path in TEMP_DIR.iterdir():
             if not path.is_file():
                 continue
 
@@ -3083,9 +3086,9 @@ class SimpleAgentTUI(TuiFormatter):
         if not isinstance(clipboard_data, Image.Image):
             return None
 
-        ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
         filename = datetime.now().strftime("clipboard_%Y%m%d_%H%M%S.png")
-        output_path = ATTACHMENTS_DIR / filename
+        output_path = TEMP_DIR / filename
 
         try:
             clipboard_data.save(output_path, "PNG")

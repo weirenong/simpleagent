@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Sequence
+import shutil
+from datetime import datetime
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +40,7 @@ from typing import Any, Sequence
 # ---------------------------------------------------------------------------
 
 class EditStrategy(str, Enum):
+    AUTO = "auto"           # detect from output
     WHOLE_FILE = "whole_file"
     SEARCH_REPLACE = "search_replace"
     UNIFIED_DIFF = "unified_diff"
@@ -126,6 +129,14 @@ class EditBlock:
     safe_updated_text: str | None = None
     has_risky_changes: bool = False
 
+@dataclass
+class PatchWorkspace:
+    """Temporary patch workspace used to stage edits before touching originals."""
+    workspace_id: str
+    temp_dir: Path
+    original_to_temp: dict[Path, Path]
+    temp_to_original: dict[Path, Path]
+    patch_paths: list[Path]
 
 @dataclass
 class ParseError(Exception):
@@ -256,18 +267,206 @@ def _guard_paths(blocks: list[EditBlock], app: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Backup + write
+# Temporary patch workspace + staged writes
 # ---------------------------------------------------------------------------
 
-def _write_blocks(blocks: list[EditBlock]) -> None:
+def _patch_timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def _app_temp_root(app: Any | None = None, root_dir: Path | None = None) -> Path:
+    """Return the configured SimpleAgent temp root for staged /code edits."""
+    if root_dir is not None:
+        return Path(root_dir).expanduser().resolve()
+
+    app_temp_dir = getattr(app, "temp_dir", None)
+    if app_temp_dir is not None:
+        return Path(app_temp_dir).expanduser().resolve()
+
+    return Path.home().joinpath(".simpleagent", "temp").resolve()
+
+
+def _unique_temp_name(path: Path, timestamp: str) -> str:
+    return f"{path.stem}_{timestamp}{path.suffix}"
+
+
+def create_temp_workspace_for_paths(
+    paths: list[Path],
+    app: Any | None = None,
+    root_dir: Path | None = None,
+) -> PatchWorkspace:
+    """
+    Create timestamped temporary copies for one or more original files.
+
+    All /code staging files sit directly under the app's TEMP_DIR root,
+    normally ~/.simpleagent/temp/.
+
+    The original files are never modified here. Each temp filename includes the
+    workspace timestamp so repeated workflow runs do not collide.
+    """
+    timestamp = _patch_timestamp()
+    temp_dir = _app_temp_root(app=app, root_dir=root_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    original_to_temp: dict[Path, Path] = {}
+    temp_to_original: dict[Path, Path] = {}
+
+    for raw_path in paths:
+        original_path = Path(raw_path).expanduser().resolve()
+        temp_path = temp_dir / _unique_temp_name(original_path, timestamp)
+
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if original_path.exists():
+            shutil.copy2(original_path, temp_path)
+        else:
+            temp_path.write_text("", encoding="utf-8")
+
+        original_to_temp[original_path] = temp_path
+        temp_to_original[temp_path] = original_path
+
+    return PatchWorkspace(
+        workspace_id=timestamp,
+        temp_dir=temp_dir,
+        original_to_temp=original_to_temp,
+        temp_to_original=temp_to_original,
+        patch_paths=[],
+    )
+
+
+def create_temp_workspace_for_attachments(app: Any) -> PatchWorkspace:
+    """Create a timestamped temporary workspace from the currently attached files."""
+    return create_temp_workspace_for_paths(sorted(_attached_paths(app)), app=app)
+
+
+def _blocks_for_temp_workspace(
+    blocks: list[EditBlock],
+    workspace: PatchWorkspace,
+    use_safe_text: bool = False,
+) -> list[EditBlock]:
+    """Map parsed edit blocks from original files to their temp-file copies."""
+    temp_blocks: list[EditBlock] = []
+
     for block in blocks:
+        original_path = block.target_path.expanduser().resolve()
+        temp_path = workspace.original_to_temp.get(original_path)
+
+        if temp_path is None:
+            raise ParseError(
+                "File was not copied into the temporary patch workspace",
+                block.path_hint,
+            )
+
+        updated_text = (
+            block.safe_updated_text
+            if use_safe_text and block.safe_updated_text is not None
+            else block.updated_text
+        )
+
+        temp_blocks.append(
+            EditBlock(
+                path_hint=block.path_hint,
+                target_path=temp_path,
+                original_text=temp_path.read_text(encoding="utf-8") if temp_path.exists() else "",
+                updated_text=updated_text,
+                safe_updated_text=block.safe_updated_text,
+                has_risky_changes=block.has_risky_changes,
+            )
+        )
+
+    return temp_blocks
+
+
+def apply_blocks_to_temp_workspace(
+    blocks: list[EditBlock],
+    workspace: PatchWorkspace,
+    use_safe_text: bool = False,
+) -> list[Path]:
+    """
+    Generate .bak and .patch files, then apply the requested edits to temp files.
+
+    This is intentionally non-interactive so workflows can repeatedly stage
+    patches before a final human confirmation or commit step.
+    """
+    temp_blocks = _blocks_for_temp_workspace(
+        blocks,
+        workspace,
+        use_safe_text=use_safe_text,
+    )
+
+    patch_paths: list[Path] = []
+
+    for block in temp_blocks:
         path = block.target_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            path.with_suffix(path.suffix + ".bak").write_text(
-                path.read_text(encoding="utf-8"), encoding="utf-8"
+
+        original_temp_text = path.read_text(encoding="utf-8") if path.exists() else ""
+
+        backup_path = path.with_suffix(path.suffix + f".{workspace.workspace_id}.bak")
+        backup_path.write_text(original_temp_text, encoding="utf-8")
+
+        patch_text = "".join(
+            difflib.unified_diff(
+                original_temp_text.splitlines(keepends=True),
+                block.updated_text.splitlines(keepends=True),
+                fromfile=f"temp-before/{path.name}",
+                tofile=f"temp-after/{path.name}",
             )
+        )
+
+        patch_path = path.with_suffix(path.suffix + f".{workspace.workspace_id}.patch")
+        patch_path.write_text(patch_text, encoding="utf-8")
+        patch_paths.append(patch_path)
+
         path.write_text(block.updated_text, encoding="utf-8")
+
+    workspace.patch_paths.extend(patch_paths)
+    return patch_paths
+
+
+def diff_temp_workspace_against_original(workspace: PatchWorkspace) -> dict[Path, str]:
+    """Return final diffs comparing every temp file against its original file."""
+    diffs: dict[Path, str] = {}
+
+    for original_path, temp_path in workspace.original_to_temp.items():
+        original_text = original_path.read_text(encoding="utf-8") if original_path.exists() else ""
+        temp_text = temp_path.read_text(encoding="utf-8") if temp_path.exists() else ""
+
+        diff_text = "".join(
+            difflib.unified_diff(
+                original_text.splitlines(keepends=True),
+                temp_text.splitlines(keepends=True),
+                fromfile=f"original/{original_path.as_posix()}",
+                tofile=f"temp/{temp_path.name}",
+            )
+        )
+
+        diffs[original_path] = diff_text
+
+    return diffs
+
+
+def commit_temp_workspace_to_original(workspace: PatchWorkspace) -> None:
+    """Apply the staged temp-file result back to the original files."""
+    for original_path, temp_path in workspace.original_to_temp.items():
+        original_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if original_path.exists():
+            original_backup_path = original_path.with_suffix(
+                original_path.suffix + f".{workspace.workspace_id}.bak"
+            )
+            shutil.copy2(original_path, original_backup_path)
+
+        shutil.copy2(temp_path, original_path)
+
+
+def _write_blocks(blocks: list[EditBlock], app: Any | None = None) -> None:
+    workspace = create_temp_workspace_for_paths(
+        [block.target_path for block in blocks],
+        app=app,
+    )
+    apply_blocks_to_temp_workspace(blocks, workspace)
+    commit_temp_workspace_to_original(workspace)
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +659,36 @@ def _confirm_and_apply(blocks: list[EditBlock], app: Any | None = None) -> bool:
         else:
             print(f"\n[no diff] {block.path_hint} (file unchanged)")
 
+    preview_workspace = create_temp_workspace_for_paths(
+        [block.target_path for block in blocks],
+        app=app,
+    )
+    apply_blocks_to_temp_workspace(
+        blocks,
+        preview_workspace,
+        use_safe_text=True,
+    )
+    final_diffs = diff_temp_workspace_against_original(preview_workspace)
+
+    print(f"\n--- staged temp root: {preview_workspace.temp_dir} ---")
+
+    if preview_workspace.patch_paths:
+        print("Generated temp patch files:")
+        for patch_path in preview_workspace.patch_paths:
+            print(f"  {patch_path}")
+
+    for original_path, diff_text in final_diffs.items():
+        if diff_text:
+            print(f"\n--- staged final diff: {original_path.name} ---\n")
+            diff_lines = diff_text.splitlines()
+
+            if app is not None and hasattr(app, "print_tui_code_block"):
+                app.print_tui_code_block(diff_lines, "diff")
+            else:
+                print("\n".join(diff_lines))
+        else:
+            print(f"\n[no staged diff] {original_path.name} (file unchanged)")
+
     key_bindings = KeyBindings()
     decision: dict[str, str] = {"mode": "cancel"}
     has_risky_changes = any(block.has_risky_changes for block in blocks)
@@ -491,23 +720,22 @@ def _confirm_and_apply(blocks: list[EditBlock], app: Any | None = None) -> bool:
     Application(layout=Layout(body), key_bindings=key_bindings, full_screen=False).run()
 
     if decision["mode"] == "safe":
-        safe_blocks = [
-            EditBlock(
-                path_hint=block.path_hint,
-                target_path=block.target_path,
-                original_text=block.original_text,
-                updated_text=block.safe_updated_text if block.safe_updated_text is not None else block.updated_text,
-            )
-            for block in blocks
-        ]
-
-        _write_blocks(safe_blocks)
-        print(f"\nApplied safe bounded changes for {len(blocks)} file(s).\n")
+        commit_temp_workspace_to_original(preview_workspace)
+        print(f"\nApplied staged safe bounded changes for {len(blocks)} file(s).\n")
         return True
 
     if decision["mode"] == "full":
-        _write_blocks(blocks)
-        print(f"\nApplied all changes for {len(blocks)} file(s).\n")
+        full_workspace = create_temp_workspace_for_paths(
+            [block.target_path for block in blocks],
+            app=app,
+        )
+        apply_blocks_to_temp_workspace(
+            blocks,
+            full_workspace,
+            use_safe_text=False,
+        )
+        commit_temp_workspace_to_original(full_workspace)
+        print(f"\nApplied staged full changes for {len(blocks)} file(s).\n")
         return True
 
     print("\nCancelled — no files were changed.\n")
@@ -1243,9 +1471,3 @@ def _get_editor(strategy: EditStrategy):
         EditStrategy.SEARCH_REPLACE: SearchReplaceEditor(),
         EditStrategy.UNIFIED_DIFF: UnifiedDiffEditor(),
     }[strategy]
-
-class EditStrategy(str, Enum):
-    AUTO = "auto"           # detect from output
-    WHOLE_FILE = "whole_file"
-    SEARCH_REPLACE = "search_replace"
-    UNIFIED_DIFF = "unified_diff"

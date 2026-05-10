@@ -556,7 +556,7 @@ def starts_multiline_argument(line: str) -> bool:
         return False
 
     raw_name, raw_argument = line.split(":", 1)
-    name = normalise_command_name(raw_name)
+    name = raw_name.strip().lower()
     if name not in WorkflowParser.COMMAND_NAMES:
         return False
 
@@ -661,10 +661,10 @@ def parse_command_line(line: str, line_number: int) -> WorkflowCommand | None:
 
     if ":" in command_text:
         raw_name, raw_argument = command_text.split(":", 1)
-        name = normalise_command_name(raw_name)
+        name = raw_name.strip().lower()
         argument = strip_optional_quotes(raw_argument.strip())
     else:
-        name = normalise_command_name(command_text)
+        name = command_text.strip().lower()
         argument = ""
 
     if name not in WorkflowParser.COMMAND_NAMES:
@@ -678,36 +678,6 @@ def parse_command_line(line: str, line_number: int) -> WorkflowCommand | None:
     )
 
 
-def normalise_command_name(value: str) -> str:
-    cleaned = value.strip().lower()
-    cleaned = re.sub(r"[^a-z0-9]+", "_", cleaned)
-    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
-
-    aliases = {
-        "start_prompt": "prompt_start",
-        "end_prompt": "prompt_end",
-        "persona_context": "add_persona_context",
-        "add_persona": "add_persona_context",
-        "recent_messages": "add_recent_messages",
-        "memory_context": "add_memory_context",
-        "relevant_memory_context": "add_memory_context",
-        "add_recent_memory": "add_recent_messages",
-        "attachment_context": "add_attachment_context",
-        "web_context": "add_web_context",
-        "system_context": "add_system_context",
-        "add_context": "add_system_context",
-        "context": "add_system_context",
-        "original_user_prompt": "add_original_user_prompt",
-        "user_prompt": "add_user_prompt",
-        "echo": "print",
-        "append_original_user_prompt": "add_to_original_user_prompt",
-        "append_to_original_user_prompt": "add_to_original_user_prompt",
-        "prompt_output": "add_prompt_output",
-        "use_prompt_output": "add_prompt_output",
-        "output_prompt": "prompt",
-    }
-
-    return aliases.get(cleaned, cleaned)
 
 
 def strip_optional_quotes(value: str) -> str:
