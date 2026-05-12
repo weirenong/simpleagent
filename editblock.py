@@ -1316,6 +1316,35 @@ class UnifiedDiffEditor:
         text = re.sub(r"^```[a-z]*\n?", "", text, flags=re.MULTILINE)
         text = re.sub(r"^\s*```\s*$", "", text, flags=re.MULTILINE)
 
+        # Try to detect if this is a unified diff without proper headers
+        # by looking for the @@ pattern at the start
+        lines = text.splitlines()
+        if lines and lines[0].strip().startswith("@@"):
+            # This looks like a unified diff without headers, try to extract path from context
+            # Look for a path hint in the surrounding lines
+            path_hint = ""
+            for i, line in enumerate(lines):
+                if line.strip().startswith("---") or line.strip().startswith("+++"):
+                    # This is a header line, extract path
+                    header_match = self._DIFF_HEADER_RE.match(line)
+                    if header_match:
+                        raw_path = header_match.group(1).strip()
+                        path_hint = raw_path.removeprefix("a/").removeprefix("b/").strip()
+                        break
+                elif i > 0 and i < len(lines) - 1:
+                    # Check if this line looks like a path hint
+                    if line.strip() and not line.strip().startswith("@@") and not line.strip().startswith("+++") and not line.strip().startswith("---"):
+                        # Try to extract path from context
+                        path_candidate = _normalise_llm_path_hint(line.strip())
+                        if path_candidate and _is_probable_path(path_candidate):
+                            path_hint = path_candidate
+                            break
+            
+            # If we found a path hint, create a fake header
+            if path_hint:
+                fake_header = f"--- a/{path_hint}\n+++ b/{path_hint}\n"
+                text = fake_header + text
+        
         chunks: list[tuple[str, str]] = []
         current_hint = ""
         current_lines: list[str] = []
