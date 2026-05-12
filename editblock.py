@@ -1322,8 +1322,18 @@ class UnifiedDiffEditor:
         chunks: list[tuple[str, str]] = []
         current_hint = ""
         current_lines: list[str] = []
+        first_line_processed = False
 
         for line in text.splitlines():
+            # Handle the case where the first line is a filename
+            if not first_line_processed and not line.startswith("---") and not line.startswith("+++"):
+                # Check if this looks like a filename (not a diff header)
+                if line.strip() and not line.strip().startswith("@@") and not line.strip().startswith("diff"):
+                    # This is likely a filename - store it and continue
+                    current_hint = line.strip()
+                    first_line_processed = True
+                    continue
+            
             m = self._DIFF_HEADER_RE.match(line)
             if m and line.startswith("---"):
                 # New file diff starting — flush previous.
@@ -1332,6 +1342,7 @@ class UnifiedDiffEditor:
                 raw_path = m.group(1).strip()
                 current_hint = raw_path.removeprefix("a/").removeprefix("b/")
                 current_lines = [line]
+                first_line_processed = True
                 continue
 
             if current_hint:
