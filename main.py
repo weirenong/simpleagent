@@ -43,6 +43,7 @@ from prompt_toolkit.styles import Style
 
 from ollama import OllamaClient, OllamaConfig
 from utils import VectorMemoryIndex, vectorise_text
+from pollinations import PollinationsClient, PollinationsConfig
 
 from PIL import Image, ImageGrab
 
@@ -591,6 +592,12 @@ class SimpleAgentTUI(TuiFormatter):
                 top_p=0.9,
                 timeout=180,
             )
+        )
+        
+        # Initialize Pollinations client
+        pollinations_api_key = os.getenv("POLLINATIONS_API_KEY")
+        self.pollinations_client = PollinationsClient(
+            PollinationsConfig(api_key=pollinations_api_key)
         )
 
         self.install_resize_handler()
@@ -2564,7 +2571,11 @@ class SimpleAgentTUI(TuiFormatter):
         if command == "/model-chat":
             if not arg:
                 if self.model_num_context is None:
-                    self.model_num_context = self.get_ollama_model_num_context(self.model)
+                    # Check if this is a Pollinations model
+                    if self.model in self.pollinations_client.list_models_whitelisted():
+                        self.model_num_context = None  # Pollinations models don't have context length info
+                    else:
+                        self.model_num_context = self.get_ollama_model_num_context(self.model)
                 print()
                 self.print_info(f"Current model: {self.model}{self.format_num_context(self.model_num_context)}")
                 print()
@@ -2576,7 +2587,11 @@ class SimpleAgentTUI(TuiFormatter):
         if command == "/model-embedding":
             if not arg:
                 if self.embedding_model_num_context is None:
-                    self.embedding_model_num_context = self.get_ollama_model_num_context(self.embedding_model)
+                    # Check if this is a Pollinations model
+                    if self.embedding_model in self.pollinations_client.list_models_whitelisted():
+                        self.embedding_model_num_context = None  # Pollinations models don't have context length info
+                    else:
+                        self.embedding_model_num_context = self.get_ollama_model_num_context(self.embedding_model)
                 print()
                 self.print_info(
                     f"Current embeddings model: {self.embedding_model}{self.format_num_context(self.embedding_model_num_context)}"
@@ -2590,7 +2605,11 @@ class SimpleAgentTUI(TuiFormatter):
         if command == "/model-vision":
             if not arg:
                 if self.vision_model_num_context is None:
-                    self.vision_model_num_context = self.get_ollama_model_num_context(self.vision_model)
+                    # Check if this is a Pollinations model
+                    if self.vision_model in self.pollinations_client.list_models_whitelisted():
+                        self.vision_model_num_context = None  # Pollinations models don't have context length info
+                    else:
+                        self.vision_model_num_context = self.get_ollama_model_num_context(self.vision_model)
                 print()
                 self.print_info(
                     f"Current vision model: {self.vision_model}{self.format_num_context(self.vision_model_num_context)}"
@@ -3137,8 +3156,13 @@ class SimpleAgentTUI(TuiFormatter):
 
     def set_model(self, model: str, persist: bool = True) -> None:
         self.model = model
-        self.client.config.model = model
-        self.model_num_context = self.get_ollama_model_num_context(model)
+        # Check if this is a Pollinations model
+        if model in self.pollinations_client.list_models_whitelisted():
+            # For Pollinations models, we don't use the Ollama client
+            self.model_num_context = None
+        else:
+            self.client.config.model = model
+            self.model_num_context = self.get_ollama_model_num_context(model)
 
         if persist:
             self.config["model"] = model
@@ -3152,7 +3176,11 @@ class SimpleAgentTUI(TuiFormatter):
 
     def set_embedding_model(self, model: str, persist: bool = True) -> None:
         self.embedding_model = model
-        self.embedding_model_num_context = self.get_ollama_model_num_context(model)
+        # Check if this is a Pollinations model
+        if model in self.pollinations_client.list_models_whitelisted():
+            self.embedding_model_num_context = None
+        else:
+            self.embedding_model_num_context = self.get_ollama_model_num_context(model)
 
         if persist:
             self.config["embedding_model"] = self.embedding_model
@@ -3168,7 +3196,11 @@ class SimpleAgentTUI(TuiFormatter):
 
     def set_vision_model(self, model: str, persist: bool = True) -> None:
         self.vision_model = model
-        self.vision_model_num_context = self.get_ollama_model_num_context(model)
+        # Check if this is a Pollinations model
+        if model in self.pollinations_client.list_models_whitelisted():
+            self.vision_model_num_context = None
+        else:
+            self.vision_model_num_context = self.get_ollama_model_num_context(model)
 
         if persist:
             self.config["vision_model"] = self.vision_model
@@ -3183,29 +3215,48 @@ class SimpleAgentTUI(TuiFormatter):
             )
 
     def show_models(self) -> None:
+        # Show Ollama models
         try:
-            models = self.client.list_models()
+            ollama_models = self.client.list_models()
         except Exception as exc:
-            self.print_error(f"Could not list models: {exc}")
-            return
+            self.print_error(f"Could not list Ollama models: {exc}")
+            ollama_models = []
 
-        if not models:
-            self.print_dim("No Ollama models found. Try: ollama pull nemotron-3-nano:4b")
+        # Show Pollinations models
+        pollinations_models = self.pollinations_client.list_models_whitelisted()
+        
+        if not ollama_models and not pollinations_models:
+            self.print_dim("No models found. Try: ollama pull nemotron-3-nano:4b")
             return
 
         print()
-        print(self.bold("Installed Ollama models:"))
-        for model in models:
-            markers = []
-            if model == self.model:
-                markers.append("chat")
-            if model == self.embedding_model:
-                markers.append("embed")
-            if model == self.vision_model:
-                markers.append("vision")
-            marker_text = f" * [{' / '.join(markers)}]" if markers else ""
-            num_context = self.get_ollama_model_num_context(model)
-            print(f"  {model}{self.format_num_context(num_context)}{marker_text}")
+        if ollama_models:
+            print(self.bold("Installed Ollama models:"))
+            for model in ollama_models:
+                markers = []
+                if model == self.model:
+                    markers.append("chat")
+                if model == self.embedding_model:
+                    markers.append("embed")
+                if model == self.vision_model:
+                    markers.append("vision")
+                marker_text = f" * [{' / '.join(markers)}]" if markers else ""
+                num_context = self.get_ollama_model_num_context(model)
+                print(f"  {model}{self.format_num_context(num_context)}{marker_text}")
+        
+        if pollinations_models:
+            print(self.bold("Pollinations models:"))
+            for model in pollinations_models:
+                markers = []
+                if model == self.model:
+                    markers.append("chat")
+                if model == self.embedding_model:
+                    markers.append("embed")
+                if model == self.vision_model:
+                    markers.append("vision")
+                marker_text = f" * [{' / '.join(markers)}]" if markers else ""
+                # Pollinations models don't have context length info
+                print(f"  {model}{marker_text}")
         print()
 
     def show_workflow_help(self) -> None:
