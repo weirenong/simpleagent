@@ -3181,20 +3181,6 @@ class SimpleAgentTUI(TuiFormatter):
         for line in MASCOT_LINES:
             print(self.blue(line))
 
-        # Check connectivity
-        pollinations_configured = bool(os.getenv("POLLINATIONS_API_KEY") or self.config.get("pollinations_api_key"))
-        ollama_available = self.client.is_available()
-        
-        if pollinations_configured:
-            print(self.green("Pollinations: Ready"))
-        else:
-            print(self.yellow("Pollinations: Not Configured (use /api-pollinations)"))
-        if ollama_available:
-            print(self.green("Ollama: Ready"))
-        else:
-            print(self.red("Ollama: Unavailable"))
-        print()
-
     def show_about(self) -> None:
         print()
         print(self.bold(APP_NAME))
@@ -3495,7 +3481,7 @@ class SimpleAgentTUI(TuiFormatter):
                 return
             
             # Display instructions
-            self.print_info(f"Please visit: https://enter.pollinations.ai{verification_uri}")
+            self.print_info(f"Please visit: {verification_uri}")
             self.print_info(f"Enter this code: {user_code}")
             self.print_dim("Then click 'Allow' to authorize this app.")
             print()
