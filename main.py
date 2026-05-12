@@ -406,6 +406,7 @@ BUILT_IN_PERSONA_NAMES = {"Default", "Coding"}
 
 DEFAULT_PERSONA_PROMPT = """
 You are SimpleAgent, an agent built for fast, practical work.
+Limit your internal reasoning to under 2000 words.
 
 Operating rules:
 - Be concise, high-signal, and action-oriented.
@@ -419,13 +420,8 @@ Operating rules:
 """.strip()
 
 DEFAULT_CODING_PERSONA_PROMPT = """
-You are SimpleAgent Coder, an expert software developer.
-You will always output code in the search and replace format:
-<<<<<<< SEARCH
-[exact code to search for]
-=======
-[exact code to replace with]
->>>>>>> REPLACE
+You are SimpleAgent, a precise coding assistant. Follow instructions exactly. Never add extra text.
+Limit your internal reasoning to under 2000 words.
 """.strip()
 
 DEFAULT_PERSONAS = {

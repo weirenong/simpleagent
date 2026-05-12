@@ -9,6 +9,7 @@ from typing import Any
 import re
 import shutil
 import utils
+import editblock
 
 
 DEFAULT_WORKFLOW_MARKDOWN = """
@@ -113,6 +114,8 @@ class WorkflowParser:
         "add_user_prompt",
         "print",
         "prompt",
+        "stage_code_changes",
+        "stage_diffs",
     }
 
     def parse_file(self, path: str | Path) -> WorkflowDefinition:
@@ -221,6 +224,7 @@ class WorkflowRunner:
         prompt_results: dict[str, WorkflowPromptResult] = {}
         visible_output = ""
         last_messages: list[dict[str, str]] = []
+        runtime_context: dict[str, Any] = {}
 
         for prompt_block in self.workflow.prompts:
             if execute_model:
@@ -230,6 +234,7 @@ class WorkflowRunner:
                 prompt_block=prompt_block,
                 original_user_prompt=original_user_prompt,
                 prompt_results=prompt_results,
+                runtime_context=runtime_context,
             )
             last_messages = messages
 
@@ -277,9 +282,11 @@ class WorkflowRunner:
         prompt_block: WorkflowPromptBlock,
         original_user_prompt: str,
         prompt_results: dict[str, WorkflowPromptResult],
+        runtime_context: dict[str, Any] | None = None,
     ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
         original_prompt_additions: list[str] = []
+        runtime_context = runtime_context or {}
 
         for command in prompt_block.commands:
             if command.name == "add_persona_context":
@@ -332,6 +339,47 @@ class WorkflowRunner:
                 if command.argument:
                     messages.append({"role": "user", "content": command.argument})
                 continue
+
+            if command.name == "stage_code_changes":
+                source_prompt_name = normalise_prompt_name(
+                    command.argument or prompt_block.name
+                )
+
+                prompt_result = prompt_results.get(source_prompt_name)
+
+                if prompt_result is None:
+                    raise WorkflowExecutionError(
+                        f"Could not find prompt output for stage_code_changes: {source_prompt_name}"
+                    )
+
+                llm_output = (
+                        prompt_result.raw_output
+                        or prompt_result.visible_output
+                )
+
+                workspace, patch_paths = editblock.apply_llm_edits_to_temp(
+                    app=self.app,
+                    llm_output=llm_output,
+                )
+
+                runtime_context["staged_workspace"] = workspace
+                runtime_context["staged_patch_paths"] = patch_paths
+                continue
+
+            if command.name == "stage_diffs":
+                workspace = runtime_context.get("staged_workspace")
+
+                if workspace is None:
+                    raise WorkflowExecutionError(
+                        "stage_diffs called before stage_code_changes"
+                    )
+
+                editblock.print_final_diffs(
+                    workspace,
+                    app=self.app,
+                )
+                continue
+
 
             if command.name in {"prompt", "print"}:
                 continue
