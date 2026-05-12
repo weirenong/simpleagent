@@ -906,13 +906,15 @@ class SimpleAgentTUI(TuiFormatter):
         self.clear_screen()
         self.show_landing_page()
 
-        if not self.client.is_available():
-            self.print_error("Ollama is not reachable. Start it with: ollama serve")
-            return
-
+        # Check if Pollinations API is configured
+        pollinations_configured = bool(os.getenv("POLLINATIONS_API_KEY") or self.config.get("pollinations_api_key"))
+        
         self.refresh_model_context_lengths()
         self.print_info(f"Workspace: {self.workspace_dir}")
-        self.print_info("Connected to Ollama.")
+        if pollinations_configured:
+            self.print_info("Connected to Pollinations API.")
+        else:
+            self.print_info("Connected to Pollinations API (not authenticated).")
         self.print_info(f"Model: {self.model}{self.format_num_context(self.model_num_context)}")
         self.print_info(f"Embedding: {self.embedding_model}{self.format_num_context(self.embedding_model_num_context)}")
         self.print_info(f"Vision: {self.vision_model}{self.format_num_context(self.vision_model_num_context)}")
@@ -2517,10 +2519,16 @@ class SimpleAgentTUI(TuiFormatter):
 
         self.show_thinking = not self.show_thinking
 
+        # Check if Pollinations API is configured
+        pollinations_configured = bool(os.getenv("POLLINATIONS_API_KEY") or self.config.get("pollinations_api_key"))
+        
         self.clear_screen()
         self.show_landing_page()
         self.print_info(f"Workspace: {self.workspace_dir}")
-        self.print_info("Connected to Ollama.")
+        if pollinations_configured:
+            self.print_info("Connected to Pollinations API.")
+        else:
+            self.print_info("Connected to Pollinations API (not authenticated).")
         self.print_info(f"Model: {self.model}{self.format_num_context(self.model_num_context)}")
         self.print_info(f"Embedding: {self.embedding_model}{self.format_num_context(self.embedding_model_num_context)}")
         self.print_info(f"Vision: {self.vision_model}{self.format_num_context(self.vision_model_num_context)}")
@@ -2727,6 +2735,11 @@ class SimpleAgentTUI(TuiFormatter):
         self.delete_temp_files()
         self.attachments.clear()
         self.next_input_prefill = ""
+        
+        # Check if Pollinations API is configured
+        pollinations_configured = bool(os.getenv("POLLINATIONS_API_KEY") or self.config.get("pollinations_api_key"))
+        if not pollinations_configured:
+            self.print_dim("Pollinations API authentication required for full functionality.")
 
     # -----------------------------
     # Attachments
@@ -3143,6 +3156,12 @@ class SimpleAgentTUI(TuiFormatter):
         for line in MASCOT_LINES:
             print(self.blue(line))
 
+        # Check if Pollinations API is configured
+        pollinations_configured = bool(os.getenv("POLLINATIONS_API_KEY") or self.config.get("pollinations_api_key"))
+        if pollinations_configured:
+            print(self.green("Pollinations API: Authenticated"))
+        else:
+            print(self.yellow("Pollinations API: Not authenticated (use /api-pollinations)"))
         print()
 
     def show_about(self) -> None:
@@ -3151,7 +3170,12 @@ class SimpleAgentTUI(TuiFormatter):
         print("A Claude Code-style terminal interface for your SimpleAgent variant.")
         print()
         print("Backend:")
-        print(f"  Ollama host: {self.host}")
+        # Check if Pollinations API is configured
+        pollinations_configured = bool(os.getenv("POLLINATIONS_API_KEY") or self.config.get("pollinations_api_key"))
+        if pollinations_configured:
+            print("  Pollinations API: Authenticated")
+        else:
+            print("  Pollinations API: Not authenticated")
         print(f"  Model:       {self.model}{self.format_num_context(self.model_num_context)}")
         print(f"  Embeddings:  {self.embedding_model}{self.format_num_context(self.embedding_model_num_context)}")
         print(f"  Vision:      {self.vision_model}{self.format_num_context(self.vision_model_num_context)}")
