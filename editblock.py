@@ -1280,8 +1280,9 @@ class SearchReplaceEditor:
 
 class UnifiedDiffEditor:
     """
-    Very robust unified diff handler for small models (<10B).
-    Handles malformed headers, missing context, duplicate lines, etc.
+    Unified diff handler that parses diffs using two methods:
+    1. Hunk numbering from standard unified diffs
+    2. Matching unchanged/deletion lines to find correct positions (fallback)
     """
 
     _DIFF_HEADER_RE = re.compile(r"^--- a?/?(.*)")
@@ -1302,7 +1303,7 @@ class UnifiedDiffEditor:
                 file_texts[target] = (path_hint, original, original)
 
             _, _, current = file_texts[target]
-            updated = self._apply_patch_robust(current, diff_text)
+            updated = self._apply_patch_with_two_methods(current, diff_text)
             file_texts[target] = (path_hint, original, updated)
 
         return [
@@ -1367,166 +1368,191 @@ class UnifiedDiffEditor:
 
         return hunks
 
-    def _apply_patch_robust(self, original: str, diff_text: str) -> str:
-        """Last-resort robust patching."""
+    def _apply_patch_with_two_methods(self, original: str, diff_text: str) -> str:
+        """Apply patch using both hunk numbering method and fallback matching method."""
         if not diff_text.strip():
             return original
 
-        result = original.splitlines(keepends=True)
+        # Method 1: Try to parse using hunk numbering
+        try:
+            result = self._apply_patch_by_hunk_numbering(original, diff_text)
+            return result
+        except Exception:
+            # Fall back to method 2 if hunk numbering fails
+            pass
 
+        # Method 2: Fallback matching approach
+        return self._apply_patch_by_matching_lines(original, diff_text)
+
+    def _apply_patch_by_hunk_numbering(self, original: str, diff_text: str) -> str:
+        """Apply patch using hunk numbering approach."""
+        result = original.splitlines(keepends=True)
+        
         for hunk in self._split_hunks(diff_text):
             if not hunk.strip():
                 continue
-
+                
             hunk_lines = hunk.splitlines()
             if not hunk_lines:
                 continue
 
-            # Parse the @@ header for the expected (1-based) line number so we
-            # can seed the fuzzy search near the right region.
-            expected_pos = 0
+            # Parse hunk header to get line numbers
+            hunk_header = None
             for line in hunk_lines:
-                hunk_header = re.match(r"^@@ -(\d+)", line)
-                if hunk_header:
-                    expected_pos = max(0, int(hunk_header.group(1)) - 1)
+                if line.startswith('@@'):
+                    hunk_header = line
                     break
+                    
+            if not hunk_header:
+                continue
+                
+            # Extract line numbers from hunk header
+            # Format: @@ -start,count +start,count @@
+            match = re.search(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', hunk_header)
+            if not match:
+                continue
+                
+            old_start = int(match.group(1)) - 1  # Convert to 0-based indexing
+            old_count = int(match.group(2)) if match.group(2) else 1
+            new_start = int(match.group(3)) - 1  # Convert to 0-based indexing
+            new_count = int(match.group(4)) if match.group(4) else 1
 
-            # Parse additions and removals.
-            # IMPORTANT: only accumulate context lines that appear *before* the
-            # first change marker into `pre_context`.  Old code lumped pre- and
-            # post-change context together, which scrambled the anchor order and
-            # caused the hunk to land in the wrong position.
-            pre_context: list[str] = []   # context before first +/-
-            removals:    list[str] = []
-            additions:   list[str] = []
+            # Parse additions and removals
+            removals = []
+            additions = []
+            context_lines = []
             saw_change = False
-
+            
             for line in hunk_lines:
                 if line.startswith(("---", "+++", "@@")):
                     continue
-                if line.startswith(" "):
-                    if not saw_change:
-                        pre_context.append(line[1:] + "\n")
-                    # post-change context lines are not needed for anchoring
+                elif line.startswith(" "):
+                    context_lines.append(line[1:] + "\n")
                 elif line.startswith("-"):
-                    saw_change = True
                     removals.append(line[1:] + "\n")
-                elif line.startswith("+"):
                     saw_change = True
+                elif line.startswith("+"):
                     additions.append(line[1:] + "\n")
+                    saw_change = True
 
-            if not removals and not additions:
-                continue
-
-            # The anchor is: lines that must exist in the file at the edit site
-            # (pre-change context followed by the lines being removed).
-            anchor = pre_context + removals
-
-            # Pure insertion with no surrounding context
-            if not anchor and additions:
-                # For pure insertions, append to the end
-                result.extend(additions)
-                continue
-
-            # Find best match position
-            pos = self._find_best_hunk_position(result, expected_pos, anchor)
-
-            # The position returned by _find_best_hunk_position is the start of the anchor match
-            # But we need to adjust for the fact that the hunk header tells us where the change should start
-            # The hunk header @@ -X,Y +Z,W @@ means:
-            # - Start at line X in the original file (1-indexed)
-            # - Remove Y lines 
-            # - Insert W lines starting at line Z in the new file
-            # So we should be replacing at position pos, but we also need to account for the fact
-            # that the hunk header gives us a more precise location
-            
-            # Calculate the actual position based on the hunk header
-            # The expected_pos is already converted to 0-based index
-            # But we also need to consider the pre_context length
-            actual_pos = pos
-            
-            # If we have pre_context, we need to adjust the position accordingly
-            # The anchor starts at pos, but the actual replacement should happen at the position
-            # indicated by the hunk header
-            replace_count = len(removals)
-            
-            # Safety: check if we're trying to replace beyond the file bounds
-            if pos + replace_count > len(result):
-                # If we're going past the end, adjust to fit
-                replace_count = len(result) - pos
-            
-            # Check for exact match to avoid duplicates
-            if replace_count > 0:
-                # Check if the removals match exactly at the calculated position
-                if pos + replace_count <= len(result):
-                    actual_removals = result[pos:pos + replace_count]
-                    if actual_removals == removals:
-                        # Exact match - replace in place
-                        result[pos:pos + replace_count] = additions
-                    else:
-                        # Not an exact match - use fuzzy matching
-                        # This should be handled by the existing fuzzy logic
-                        result[pos:pos + replace_count] = additions
-                else:
-                    # Handle edge case where we're replacing beyond file bounds
-                    result[pos:] = additions
-            else:
-                # No removals to replace, just insert additions at the calculated position
-                if pos <= len(result):
-                    # Insert at the position indicated by the hunk header
-                    # But we need to be careful about where we insert
-                    insert_pos = pos
-                    # If we're inserting at the beginning of the file, we can just extend
-                    if insert_pos == 0:
-                        # Insert at the beginning
-                        result = additions + result
-                    else:
-                        # Insert in the middle
-                        result[insert_pos:insert_pos] = additions
-                else:
-                    result.extend(additions)
-
+            # Apply the changes at the specified position
+            # Adjust for the fact that we're working with 0-based indices
+            if removals or additions:
+                # Calculate the actual position in the file
+                pos = old_start
+                
+                # Ensure we don't go out of bounds
+                if pos < 0:
+                    pos = 0
+                if pos > len(result):
+                    pos = len(result)
+                    
+                # Replace the specified number of lines
+                if old_count > 0:
+                    # Remove old lines
+                    end_pos = min(pos + old_count, len(result))
+                    del result[pos:end_pos]
+                    
+                # Insert new lines
+                result[pos:pos] = additions
+                
         return "".join(result)
 
-    def _find_best_hunk_position(
-        self, result: list[str], expected_pos: int, anchor: list[str]
-    ) -> int:
-        """Fuzzy anchor search.
+    def _apply_patch_by_matching_lines(self, original: str, diff_text: str) -> str:
+        """Apply patch by matching unchanged/deletion lines to find correct positions."""
+        result = original.splitlines(keepends=True)
+        
+        # Split into hunks
+        hunks = self._split_hunks(diff_text)
+        
+        for hunk in hunks:
+            if not hunk.strip():
+                continue
+                
+            hunk_lines = hunk.splitlines()
+            if not hunk_lines:
+                continue
 
-        Always scans the full file for the best-scoring position.  We bias
-        towards ``expected_pos`` by trying it first and short-circuiting on a
-        perfect match, but we never restrict the search to a narrow window
-        around it — that caused misses when the LLM's line numbers were off.
-        """
-        if not anchor:
-            return max(0, min(expected_pos, len(result)))
+            # Parse hunk header to get line numbers
+            hunk_header = None
+            for line in hunk_lines:
+                if line.startswith('@@'):
+                    hunk_header = line
+                    break
+                    
+            if not hunk_header:
+                continue
+                
+            # Extract line numbers from hunk header
+            match = re.search(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', hunk_header)
+            if not match:
+                continue
+                
+            old_start = int(match.group(1)) - 1  # Convert to 0-based indexing
+            old_count = int(match.group(2)) if match.group(2) else 1
+            new_start = int(match.group(3)) - 1  # Convert to 0-based indexing
+            new_count = int(match.group(4)) if match.group(4) else 1
 
-        n = len(anchor)
-        norm_result = [line.rstrip("\n") for line in result]
-        norm_anchor = [line.rstrip("\n") for line in anchor]
+            # Parse additions and removals
+            removals = []
+            additions = []
+            context_lines = []
+            saw_change = False
+            
+            for line in hunk_lines:
+                if line.startswith(("---", "+++", "@@")):
+                    continue
+                elif line.startswith(" "):
+                    context_lines.append(line[1:] + "\n")
+                elif line.startswith("-"):
+                    removals.append(line[1:] + "\n")
+                    saw_change = True
+                elif line.startswith("+"):
+                    additions.append(line[1:] + "\n")
+                    saw_change = True
 
-        def score_at(idx: int) -> int:
-            if idx + n > len(norm_result):
-                return -1
-            return sum(a == b for a, b in zip(norm_result[idx:idx + n], norm_anchor))
+            # Find the correct position by matching context lines
+            if removals or additions:
+                # Find the position where the removals should be replaced
+                pos = self._find_position_by_matching_context(result, removals, old_start)
+                
+                # Ensure we don't go out of bounds
+                if pos < 0:
+                    pos = 0
+                if pos > len(result):
+                    pos = len(result)
+                    
+                # Replace the specified number of lines
+                if old_count > 0:
+                    # Remove old lines
+                    end_pos = min(pos + old_count, len(result))
+                    del result[pos:end_pos]
+                    
+                # Insert new lines
+                result[pos:pos] = additions
+                
+        return "".join(result)
 
-        # Try the expected position first for a quick perfect-match exit.
-        if 0 <= expected_pos <= len(result) - n:
-            if score_at(expected_pos) == n:
-                return expected_pos
-
-        best_pos = 0
-        best_score = -1
-
-        for pos in range(max(0, len(result) - n + 1)):
-            sc = score_at(pos)
-            if sc > best_score:
-                best_score = sc
-                best_pos = pos
-            if sc == n:  # perfect match — stop immediately
-                return pos
-
-        return best_pos
+    def _find_position_by_matching_context(self, file_lines: list[str], removals: list[str], expected_pos: int) -> int:
+        """Find the correct position by matching context lines."""
+        if not removals:
+            return expected_pos
+            
+        # Try to find exact match first
+        for i in range(len(file_lines) - len(removals) + 1):
+            # Check if removals match at position i
+            match = True
+            for j, removal in enumerate(removals):
+                if i + j >= len(file_lines) or file_lines[i + j].rstrip('\n') != removal.rstrip('\n'):
+                    match = False
+                    break
+                    
+            if match:
+                return i
+                
+        # If no exact match, try to find approximate match by looking for similar context
+        # This is a simplified approach - in practice, you'd want more sophisticated matching
+        return max(0, expected_pos)
 
 
 # ---------------------------------------------------------------------------
