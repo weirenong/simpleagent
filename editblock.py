@@ -1486,10 +1486,14 @@ class UnifiedDiffEditor:
                 if pos > len(result):
                     pos = len(result)
                     
-                # Replace the specified number of lines
-                if old_count > 0:
-                    # Remove old lines
-                    end_pos = min(pos + old_count, len(result))
+                # Instead of blindly removing old_count lines, we should remove only the lines that are actually marked for removal
+                # Count how many lines we actually have to remove
+                actual_removal_count = len(removals)
+                
+                # Remove the actual lines that were marked for removal
+                if actual_removal_count > 0:
+                    # Remove the actual removal lines from the result
+                    end_pos = min(pos + actual_removal_count, len(result))
                     if end_pos > pos:
                         del result[pos:end_pos]
                     
