@@ -1,5 +1,6 @@
 import os
 import requests
+import time
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
@@ -9,6 +10,7 @@ class PollinationsConfig:
     base_url: str = "https://gen.pollinations.ai"
     api_key: Optional[str] = None
     safe: Optional[str] = None
+    client_id: Optional[str] = None  # For Bring Your Own Pollen
 
 
 class PollinationsClient:
@@ -22,6 +24,10 @@ class PollinationsClient:
         if config.safe:
             self.session.headers.update({
                 "Pollinations-Safe": config.safe
+            })
+        if config.client_id:
+            self.session.headers.update({
+                "Client-ID": config.client_id
             })
 
     def chat_completions(self, 
@@ -119,5 +125,53 @@ class PollinationsClient:
         url = f"{self.config.base_url}/account/usage"
         
         response = self.session.get(url)
+        response.raise_for_status()
+        return response.json()
+
+    def request_device_code(self, scope: str = "generate") -> Dict[str, Any]:
+        """Request a device code for Bring Your Own Pollen (Device Flow)"""
+        url = f"{self.config.base_url}/api/device/code"
+        
+        payload = {
+            "client_id": self.config.client_id,
+            "scope": scope
+        }
+        
+        response = self.session.post(url, json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    def poll_for_device_token(self, device_code: str, poll_interval: int = 5) -> Dict[str, Any]:
+        """Poll for the user-authorized token (Device Flow)"""
+        url = f"{self.config.base_url}/api/device/token"
+        
+        payload = {
+            "device_code": device_code
+        }
+        
+        while True:
+            response = self.session.post(url, json=payload)
+            
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 400:
+                data = response.json()
+                if data.get("error") == "authorization_pending":
+                    time.sleep(poll_interval)
+                    continue
+                else:
+                    response.raise_for_status()
+            else:
+                response.raise_for_status()
+
+    def get_user_info(self, access_token: str) -> Dict[str, Any]:
+        """Get user information using an access token"""
+        url = f"{self.config.base_url}/api/device/userinfo"
+        
+        headers = {
+            "Authorization": f"Bearer {access_token}"
+        }
+        
+        response = self.session.get(url, headers=headers)
         response.raise_for_status()
         return response.json()
