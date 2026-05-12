@@ -1280,13 +1280,20 @@ class SearchReplaceEditor:
 
 class UnifiedDiffEditor:
     """
-    Unified diff handler that parses diffs using two methods:
-    1. Hunk numbering from standard unified diffs
-    2. Matching unchanged/deletion lines to find correct positions (fallback)
+    Parse standard unified-diff output from the LLM and apply it.
+
+    Expected format (inside a ```diff block or bare):
+        --- a/path/to/file.py
+        +++ b/path/to/file.py
+        @@ -10,7 +10,8 @@
+         context
+        -removed line
+        +added line
+         context
     """
 
     _DIFF_HEADER_RE = re.compile(r"^--- a?/?(.*)")
-    _HUNK_RE = re.compile(r"^@@ .* @@")
+    _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
     def parse(self, llm_output: str, app: Any) -> list[EditBlock]:
         diffs = self._split_diffs(llm_output)
@@ -1337,46 +1344,6 @@ class UnifiedDiffEditor:
 
     def _apply_diff(self, original: str, diff_text: str, path: Path) -> str:
         """Apply a unified diff to the original text, returning updated text."""
-        orig_lines = original.splitlines(keepends=True)
-        result_lines = list(orig_lines)
-        offset = 0
-
-        for hunk_text in self._split_hunks(diff_text):
-            m = self._HUNK_RE.match(hunk_text.splitlines()[0])
-            if not m:
-                continue
-
-            orig_start = int(m.group(1)) - 1  # 0-indexed
-            hunk_lines = hunk_text.splitlines()[1:]  # skip @@ line
-
-            applied_lines: list[str] = []
-            i = orig_start + offset
-
-            for hunk_line in hunk_lines:
-                if hunk_line.startswith("-"):
-                    # Remove: advance in result (skip this line).
-                    i += 1
-                    offset -= 1
-                elif hunk_line.startswith("+"):
-                    # Add.
-                    new_line = hunk_line[1:]
-                    if not new_line.endswith("\n"):
-                        new_line += "\n"
-                    applied_lines.append((i, "add", new_line))
-                else:
-                    # Context line — keep.
-                    i += 1
-
-        # Re-apply: this simple approach rebuilds from scratch using difflib patcher.
-        try:
-            patched = list(difflib.restore(
-                list(difflib.unified_diff([], [], n=0)),
-                which=2,
-            ))
-        except Exception:
-            patched = []
-
-        # Fall back to Python's patch-via-ndiff for correctness.
         return self._apply_patch_robust(original, diff_text)
 
     def _apply_patch_robust(self, original: str, diff_text: str) -> str:
