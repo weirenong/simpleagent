@@ -2613,7 +2613,13 @@ class SimpleAgentTUI(TuiFormatter):
                 print()
                 return True
 
-            self.set_model(arg, persist=True)
+            # Handle model selection with prefix
+            if arg.startswith("ollama/") or arg.startswith("pollinations/"):
+                model_name = arg.split("/", 1)[1] if "/" in arg else arg
+            else:
+                model_name = arg
+            
+            self.set_model(model_name, persist=True)
             return True
 
         if command == "/model-embedding":
@@ -2631,7 +2637,13 @@ class SimpleAgentTUI(TuiFormatter):
                 print()
                 return True
 
-            self.set_embedding_model(arg, persist=True)
+            # Handle model selection with prefix
+            if arg.startswith("ollama/") or arg.startswith("pollinations/"):
+                model_name = arg.split("/", 1)[1] if "/" in arg else arg
+            else:
+                model_name = arg
+            
+            self.set_embedding_model(model_name, persist=True)
             return True
 
         if command == "/model-vision":
@@ -2649,7 +2661,13 @@ class SimpleAgentTUI(TuiFormatter):
                 print()
                 return True
 
-            self.set_vision_model(arg, persist=True)
+            # Handle model selection with prefix
+            if arg.startswith("ollama/") or arg.startswith("pollinations/"):
+                model_name = arg.split("/", 1)[1] if "/" in arg else arg
+            else:
+                model_name = arg
+            
+            self.set_vision_model(model_name, persist=True)
             return True
 
         if command == "/attach":
@@ -3213,12 +3231,11 @@ class SimpleAgentTUI(TuiFormatter):
             # For Pollinations models, we don't use the Ollama client
             self.model_num_context = None
         else:
-            self.client.config.model = model
+            # For Ollama models, we would use the Ollama client
             self.model_num_context = self.get_ollama_model_num_context(model)
 
         if persist:
             self.config["model"] = model
-            self.config["host"] = self.host
             save_config(self.config)
             self.print_info(
                 f"Model changed to: {self.model}{self.format_num_context(self.model_num_context)} and saved to {CONFIG_FILE}"
@@ -3236,7 +3253,6 @@ class SimpleAgentTUI(TuiFormatter):
 
         if persist:
             self.config["embedding_model"] = self.embedding_model
-            self.config["host"] = self.host
             save_config(self.config)
             self.print_info(
                 f"Embeddings model changed to: {self.embedding_model}{self.format_num_context(self.embedding_model_num_context)} and saved to {CONFIG_FILE}"
@@ -3256,7 +3272,6 @@ class SimpleAgentTUI(TuiFormatter):
 
         if persist:
             self.config["vision_model"] = self.vision_model
-            self.config["host"] = self.host
             save_config(self.config)
             self.print_info(
                 f"Vision model changed to: {self.vision_model}{self.format_num_context(self.vision_model_num_context)} and saved to {CONFIG_FILE}"
