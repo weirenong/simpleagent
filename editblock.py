@@ -1290,327 +1290,150 @@ class UnifiedDiffEditor:
 
     def parse(self, llm_output: str, app: Any) -> list[EditBlock]:
         diffs = self._split_diffs(llm_output)
+
         if not diffs:
-            raise ParseError("No unified diff blocks found")
+            raise ParseError(
+                "No unified diff blocks found",
+                "Ensure the model outputs --- / +++ / @@ headers.",
+            )
 
-        file_texts: dict[Path, tuple[str, str, str]] = {}
-
+        blocks: list[EditBlock] = []
         for path_hint, diff_text in diffs:
             target = _resolve_path(path_hint, app)
             original = target.read_text(encoding="utf-8") if target.exists() else ""
+            updated = self._apply_diff(original, diff_text, target)
+            blocks.append(EditBlock(path_hint, target, original, updated))
 
-            if target not in file_texts:
-                file_texts[target] = (path_hint, original, original)
-
-            _, _, current = file_texts[target]
-            updated = self._apply_patch_with_two_methods(current, diff_text)
-            file_texts[target] = (path_hint, original, updated)
-
-        return [
-            EditBlock(path_hint, target, original, updated)
-            for target, (path_hint, original, updated) in file_texts.items()
-        ]
+        return blocks
 
     def _split_diffs(self, text: str) -> list[tuple[str, str]]:
-        """Extract (path, diff_content) pairs, deduplicating identical blocks."""
+        """Split a multi-file diff response into (path_hint, diff_text) pairs."""
+        # Strip fences.
         text = re.sub(r"^```[a-z]*\n?", "", text, flags=re.MULTILINE)
-        text = re.sub(r"^\s*```\s*$", "", text, flags=re.MULTILINE)
+        text = re.sub(r"^```\s*$", "", text, flags=re.MULTILINE)
 
-        # Handle case where we have multiple diff blocks in one output
-        # Split by potential diff headers or @@ markers
-        lines = text.splitlines()
         chunks: list[tuple[str, str]] = []
         current_hint = ""
         current_lines: list[str] = []
-        i = 0
 
-        while i < len(lines):
-            line = lines[i]
-            stripped = line.strip()
-            
-            # Check if this line starts a new diff block
-            if stripped.startswith("---"):
-                header_match = self._DIFF_HEADER_RE.match(line)
-                if header_match:
-                    # Save previous diff block if exists
-                    if current_hint and current_lines:
-                        chunks.append((current_hint, "\n".join(current_lines)))
-                    
-                    # Start new diff block
-                    raw_path = header_match.group(1).strip()
-                    current_hint = raw_path.removeprefix("a/").removeprefix("b/").strip()
-                    current_lines = [line]
-                    i += 1
-                    continue
-            elif stripped.startswith("@@") and not current_hint:
-                # This is a unified diff without proper headers, try to find path hint
-                # Look backwards for a path hint
-                path_hint = ""
-                for j in range(max(0, i-10), i):
-                    if lines[j].strip() and not lines[j].strip().startswith("@@") and not lines[j].strip().startswith("+++") and not lines[j].strip().startswith("---"):
-                        path_candidate = _normalise_llm_path_hint(lines[j].strip())
-                        if path_candidate and _is_probable_path(path_candidate):
-                            path_hint = path_candidate
-                            break
-                
-                # If we found a path hint, create a fake header
-                if path_hint:
-                    fake_header = f"--- a/{path_hint}\n+++ b/{path_hint}\n"
-                    current_lines = [fake_header, line]
-                    current_hint = path_hint
-                else:
-                    # If no path hint, treat as continuation of current diff or start new one
-                    current_lines.append(line)
-            elif current_hint:
+        for line in text.splitlines():
+            m = self._DIFF_HEADER_RE.match(line)
+            if m and line.startswith("---"):
+                # New file diff starting — flush previous.
+                if current_hint and current_lines:
+                    chunks.append((current_hint, "\n".join(current_lines)))
+                raw_path = m.group(1).strip()
+                current_hint = raw_path.removeprefix("a/").removeprefix("b/")
+                current_lines = [line]
+                continue
+
+            if current_hint:
                 current_lines.append(line)
-            
-            i += 1
 
-        # Don't forget the last diff block
         if current_hint and current_lines:
             chunks.append((current_hint, "\n".join(current_lines)))
 
-        # Deduplicate: the LLM pipeline may emit the same diff block multiple
-        # times (e.g. once per self-check pass).  Applying duplicates causes
-        # repeated insertions / double-deletions, so keep only the first
-        # occurrence of each (path, normalised-diff) pair.
-        seen: set[tuple[str, str]] = set()
-        unique: list[tuple[str, str]] = []
-        for chunk in chunks:
-            key = (chunk[0], chunk[1].strip())
-            if key not in seen:
-                seen.add(key)
-                unique.append(chunk)
-        return unique
+        return chunks
+
+    def _apply_diff(self, original: str, diff_text: str, path: Path) -> str:
+        """Apply a unified diff to the original text, returning updated text."""
+        orig_lines = original.splitlines(keepends=True)
+        result_lines = list(orig_lines)
+        offset = 0
+
+        for hunk_text in self._split_hunks(diff_text):
+            m = self._HUNK_RE.match(hunk_text.splitlines()[0])
+            if not m:
+                continue
+
+            orig_start = int(m.group(1)) - 1  # 0-indexed
+            hunk_lines = hunk_text.splitlines()[1:]  # skip @@ line
+
+            applied_lines: list[str] = []
+            i = orig_start + offset
+
+            for hunk_line in hunk_lines:
+                if hunk_line.startswith("-"):
+                    # Remove: advance in result (skip this line).
+                    i += 1
+                    offset -= 1
+                elif hunk_line.startswith("+"):
+                    # Add.
+                    new_line = hunk_line[1:]
+                    if not new_line.endswith("\n"):
+                        new_line += "\n"
+                    applied_lines.append((i, "add", new_line))
+                else:
+                    # Context line — keep.
+                    i += 1
+
+        # Re-apply: this simple approach rebuilds from scratch using difflib patcher.
+        try:
+            patched = list(difflib.restore(
+                list(difflib.unified_diff([], [], n=0)),
+                which=2,
+            ))
+        except Exception:
+            patched = []
+
+        # Fall back to Python's patch-via-ndiff for correctness.
+        return self._apply_patch_robust(original, diff_text)
+
+    def _apply_patch_robust(self, original: str, diff_text: str) -> str:
+        """
+        Robust patch application using line-by-line hunk processing.
+        """
+        orig_lines = original.splitlines(keepends=True)
+        result: list[str] = list(orig_lines)
+        offset = 0
+
+        for hunk in self._split_hunks(diff_text):
+            hunk_lines = hunk.splitlines()
+            header = hunk_lines[0]
+            m = self._HUNK_RE.match(header)
+            if not m:
+                continue
+
+            orig_start = int(m.group(1)) - 1  # 0-indexed in original
+
+            removals: list[str] = []
+            additions: list[str] = []
+            for line in hunk_lines[1:]:
+                if line.startswith("-"):
+                    removals.append(line[1:])
+                elif line.startswith("+"):
+                    additions.append(line[1:])
+                # context lines ignored — we use the original
+
+            # Ensure additions end with newline.
+            additions = [
+                (a if a.endswith("\n") else a + "\n") for a in additions
+            ]
+
+            pos = orig_start + offset
+            # Replace the removal span with the additions.
+            result[pos: pos + len(removals)] = additions
+            offset += len(additions) - len(removals)
+
+        return "".join(result)
 
     def _split_hunks(self, diff_text: str) -> list[str]:
-        """Split even very broken diffs into hunks."""
+        """Split a diff into individual @@ hunks."""
         hunks: list[str] = []
         current: list[str] = []
 
-        for line in diff_text.splitlines(keepends=True):
-            stripped = line.strip()
-            # Handle hunk headers properly
-            if stripped.startswith("@@") and re.match(r'^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@', stripped):
+        for line in diff_text.splitlines():
+            if self._HUNK_RE.match(line):
                 if current:
-                    hunks.append("".join(current))
-                current = [line]
-            elif stripped.startswith("@@") and not re.match(r'^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@', stripped):
-                # Malformed hunk header - treat as start of new hunk
-                if current:
-                    hunks.append("".join(current))
+                    hunks.append("\n".join(current))
                 current = [line]
             elif current:
                 current.append(line)
 
         if current:
-            hunks.append("".join(current))
+            hunks.append("\n".join(current))
 
         return hunks
-
-    def _apply_patch_with_two_methods(self, original: str, diff_text: str) -> str:
-        """Apply patch using both hunk numbering method and fallback matching method."""
-        if not diff_text.strip():
-            return original
-
-        # Method 1: Try to parse using hunk numbering
-        try:
-            result = self._apply_patch_by_hunk_numbering(original, diff_text)
-            return result
-        except Exception as e:
-            # Fall back to method 2 if hunk numbering fails
-            pass
-
-        # Method 2: Fallback matching approach
-        return self._apply_patch_by_matching_lines(original, diff_text)
-
-    def _apply_patch_by_hunk_numbering(self, original: str, diff_text: str) -> str:
-        """Apply patch using hunk numbering approach."""
-        result = original.splitlines(keepends=True)
-        
-        for hunk in self._split_hunks(diff_text):
-            if not hunk.strip():
-                continue
-                
-            hunk_lines = hunk.splitlines()
-            if not hunk_lines:
-                continue
-
-            # Parse hunk header to get line numbers
-            hunk_header = None
-            for line in hunk_lines:
-                if line.startswith('@@') and re.match(r'^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@', line):
-                    hunk_header = line
-                    break
-                    
-            if not hunk_header:
-                continue
-                
-            # Extract line numbers from hunk header
-            # Format: @@ -start,count +start,count @@
-            match = re.search(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', hunk_header)
-            if not match:
-                continue
-                
-            old_start = int(match.group(1)) - 1  # Convert to 0-based indexing
-            old_count = int(match.group(2)) if match.group(2) else 1
-            new_start = int(match.group(3)) - 1  # Convert to 0-based indexing
-            new_count = int(match.group(4)) if match.group(4) else 1
-
-            # Parse additions and removals
-            removals = []
-            additions = []
-            context_lines = []
-            saw_change = False
-            
-            for line in hunk_lines:
-                if line.startswith(("---", "+++", "@@")):
-                    continue
-                elif line.startswith(" "):
-                    context_lines.append(line[1:] + "\n")
-                elif line.startswith("-"):
-                    removals.append(line[1:] + "\n")
-                    saw_change = True
-                elif line.startswith("+"):
-                    additions.append(line[1:] + "\n")
-                    saw_change = True
-
-            # Apply the changes at the specified position
-            if removals or additions:
-                # Calculate the actual position in the file
-                # The old_start from the hunk header indicates where the first change occurs
-                pos = old_start
-                
-                # Ensure we don't go out of bounds
-                if pos < 0:
-                    pos = 0
-                if pos > len(result):
-                    pos = len(result)
-                
-                # We need to:
-                # 1. Keep context lines before the changes (old_start lines from start)
-                # 2. Remove the old_count lines starting at old_start
-                # 3. Insert additions at that position
-                
-                # First, reconstruct the result up to the old_start position
-                before_changes = result[:old_start]
-                
-                # Calculate how many lines to remove (take the minimum of actual removals and old_count)
-                lines_to_remove = min(len(removals), old_count) if removals else old_count
-                
-                # Get the part after the lines to remove
-                remaining_start = old_start + lines_to_remove
-                
-                # Ensure we don't go out of bounds
-                if remaining_start > len(result):
-                    remaining_start = len(result)
-                
-                after_changes = result[remaining_start:]
-                
-                # Combine: before + additions + after
-                result = before_changes + additions + after_changes
-                
-        return "".join(result)
-
-    def _apply_patch_by_matching_lines(self, original: str, diff_text: str) -> str:
-        """Apply patch by matching unchanged/deletion lines to find correct positions."""
-        result = original.splitlines(keepends=True)
-        
-        # Split into hunks
-        hunks = self._split_hunks(diff_text)
-        
-        for hunk in hunks:
-            if not hunk.strip():
-                continue
-                
-            hunk_lines = hunk.splitlines()
-            if not hunk_lines:
-                continue
-
-            # Parse hunk header to get line numbers
-            hunk_header = None
-            for line in hunk_lines:
-                if line.startswith('@@') and re.match(r'^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@', line):
-                    hunk_header = line
-                    break
-                    
-            if not hunk_header:
-                continue
-                
-            # Extract line numbers from hunk header
-            match = re.search(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', hunk_header)
-            if not match:
-                continue
-                
-            old_start = int(match.group(1)) - 1  # Convert to 0-based indexing
-            old_count = int(match.group(2)) if match.group(2) else 1
-            new_start = int(match.group(3)) - 1  # Convert to 0-based indexing
-            new_count = int(match.group(4)) if match.group(4) else 1
-
-            # Parse additions and removals
-            removals = []
-            additions = []
-            context_lines = []
-            saw_change = False
-            
-            for line in hunk_lines:
-                if line.startswith(("---", "+++", "@@")):
-                    continue
-                elif line.startswith(" "):
-                    context_lines.append(line[1:] + "\n")
-                elif line.startswith("-"):
-                    removals.append(line[1:] + "\n")
-                    saw_change = True
-                elif line.startswith("+"):
-                    additions.append(line[1:] + "\n")
-                    saw_change = True
-
-            # Find the correct position by matching context lines
-            if removals or additions:
-                # Find the position where the removals should be replaced
-                pos = self._find_position_by_matching_context(result, removals, old_start)
-                
-                # Ensure we don't go out of bounds
-                if pos < 0:
-                    pos = 0
-                if pos > len(result):
-                    pos = len(result)
-                
-                # Same logic as hunk numbering - reconstruct the result
-                before_changes = result[:pos]
-                lines_to_remove = min(len(removals), old_count) if removals else old_count
-                remaining_start = pos + lines_to_remove
-                
-                if remaining_start > len(result):
-                    remaining_start = len(result)
-                
-                after_changes = result[remaining_start:]
-                
-                # Combine: before + additions + after
-                result = before_changes + additions + after_changes
-                
-        return "".join(result)
-
-    def _find_position_by_matching_context(self, file_lines: list[str], removals: list[str], expected_pos: int) -> int:
-        """Find the correct position by matching context lines."""
-        if not removals:
-            return expected_pos
-            
-        # Try to find exact match first
-        for i in range(len(file_lines) - len(removals) + 1):
-            # Check if removals match at position i
-            match = True
-            for j, removal in enumerate(removals):
-                if i + j >= len(file_lines) or file_lines[i + j].rstrip('\n') != removal.rstrip('\n'):
-                    match = False
-                    break
-                    
-            if match:
-                return i
-                
-        # If no exact match, try to find approximate match by looking for similar context
-        # This is a simplified approach - in practice, you'd want more sophisticated matching
-        return max(0, expected_pos)
 
 
 # ---------------------------------------------------------------------------
