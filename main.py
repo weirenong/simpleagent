@@ -2726,7 +2726,20 @@ class SimpleAgentTUI(TuiFormatter):
             with patch_stdout(raw=True):
                 self.clear_screen()
                 self.show_landing_page()
+                
+                # Check connectivity
+                pollinations_configured = bool(os.getenv("POLLINATIONS_API_KEY") or self.config.get("pollinations_api_key"))
+                ollama_available = self.client.is_available()
+                
                 self.print_info(f"Workspace: {self.workspace_dir}")
+                if pollinations_configured:
+                    self.print_info("Pollinations: Ready")
+                else:
+                    self.print_info("Pollinations: Not Configured")
+                if ollama_available:
+                    self.print_info("Ollama: Ready")
+                else:
+                    self.print_info("Ollama: Unavailable")
                 self.print_info(f"Model: {self.model}{self.format_num_context(self.model_num_context)}")
                 self.print_info(f"Embedding: {self.embedding_model}{self.format_num_context(self.embedding_model_num_context)}")
                 self.print_info(f"Vision: {self.vision_model}{self.format_num_context(self.vision_model_num_context)}")
