@@ -1362,25 +1362,57 @@ class UnifiedDiffEditor:
                 continue
 
             orig_start = int(m.group(1)) - 1  # 0-indexed in original
+            orig_count = int(m.group(2)) if m.group(2) else 1
 
             removals: list[str] = []
             additions: list[str] = []
+            context_lines: list[str] = []
+            
+            # Parse the hunk lines to identify removals, additions, and context
             for line in hunk_lines[1:]:
                 if line.startswith("-"):
                     removals.append(line[1:])
                 elif line.startswith("+"):
                     additions.append(line[1:])
-                # context lines ignored — we use the original
+                elif line.startswith(" "):
+                    # Context line - store for verification
+                    context_lines.append(line[1:])
+                # Lines starting with \ are ignored (they're part of the diff format)
+
+            # Find the actual position in the original file by searching for the context
+            # This ensures we match the correct location even if the diff doesn't start at exact line
+            pos = orig_start + offset
+            
+            # Verify that the context lines match what we expect
+            if context_lines and pos < len(orig_lines):
+                # Check if the context lines match the original file
+                context_match = True
+                for i, ctx_line in enumerate(context_lines):
+                    if pos + i >= len(orig_lines) or orig_lines[pos + i].rstrip('\n') != ctx_line:
+                        context_match = False
+                        break
+                
+                # If context doesn't match, search for the actual location
+                if not context_match:
+                    # Search for the first removal line in the original file
+                    if removals:
+                        first_removal = removals[0]
+                        for i in range(max(0, orig_start - 10), min(len(orig_lines), orig_start + 10)):
+                            if orig_lines[i].rstrip('\n') == first_removal.rstrip('\n'):
+                                pos = i
+                                break
 
             # Ensure additions end with newline.
             additions = [
                 (a if a.endswith("\n") else a + "\n") for a in additions
             ]
 
-            pos = orig_start + offset
+            # Calculate the actual number of lines to replace
+            actual_removal_count = len(removals) if removals else orig_count
+            
             # Replace the removal span with the additions.
-            result[pos: pos + len(removals)] = additions
-            offset += len(additions) - len(removals)
+            result[pos: pos + actual_removal_count] = additions
+            offset += len(additions) - actual_removal_count
 
         return "".join(result)
 
