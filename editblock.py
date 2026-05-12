@@ -1323,22 +1323,15 @@ class UnifiedDiffEditor:
             # This looks like a unified diff without headers, try to extract path from context
             # Look for a path hint in the surrounding lines
             path_hint = ""
-            for i, line in enumerate(lines):
-                if line.strip().startswith("---") or line.strip().startswith("+++"):
-                    # This is a header line, extract path
-                    header_match = self._DIFF_HEADER_RE.match(line)
-                    if header_match:
-                        raw_path = header_match.group(1).strip()
-                        path_hint = raw_path.removeprefix("a/").removeprefix("b/").strip()
+            # Check if there's a path hint in the first few lines before the diff
+            for i in range(min(5, len(lines))):
+                line = lines[i]
+                if line.strip() and not line.strip().startswith("@@") and not line.strip().startswith("+++") and not line.strip().startswith("---"):
+                    # Try to extract path from context
+                    path_candidate = _normalise_llm_path_hint(line.strip())
+                    if path_candidate and _is_probable_path(path_candidate):
+                        path_hint = path_candidate
                         break
-                elif i > 0 and i < len(lines) - 1:
-                    # Check if this line looks like a path hint
-                    if line.strip() and not line.strip().startswith("@@") and not line.strip().startswith("+++") and not line.strip().startswith("---"):
-                        # Try to extract path from context
-                        path_candidate = _normalise_llm_path_hint(line.strip())
-                        if path_candidate and _is_probable_path(path_candidate):
-                            path_hint = path_candidate
-                            break
             
             # If we found a path hint, create a fake header
             if path_hint:
