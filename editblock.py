@@ -1379,26 +1379,26 @@ class UnifiedDiffEditor:
                     context_lines.append(line[1:])
                 # Lines starting with \ are ignored (they're part of the diff format)
 
-            # Find the actual position in the original file by searching for the context
+            # Find the actual position in the current result file by searching for the context
             # This ensures we match the correct location even if the diff doesn't start at exact line
             pos = orig_start
             
-            # Verify that the context lines match what we expect
-            if context_lines and pos < len(orig_lines):
-                # Check if the context lines match the original file
+            # Verify that the context lines match what we expect in the current result
+            if context_lines and pos < len(result):
+                # Check if the context lines match the current result
                 context_match = True
                 for i, ctx_line in enumerate(context_lines):
-                    if pos + i >= len(orig_lines) or orig_lines[pos + i].rstrip('\n') != ctx_line:
+                    if pos + i >= len(result) or result[pos + i].rstrip('\n') != ctx_line:
                         context_match = False
                         break
                 
                 # If context doesn't match, search for the actual location
                 if not context_match:
-                    # Search for the first removal line in the original file
+                    # Search for the first removal line in the current result
                     if removals:
                         first_removal = removals[0]
-                        for i in range(max(0, orig_start - 10), min(len(orig_lines), orig_start + 10)):
-                            if orig_lines[i].rstrip('\n') == first_removal.rstrip('\n'):
+                        for i in range(max(0, orig_start - 10), min(len(result), orig_start + 10)):
+                            if result[i].rstrip('\n') == first_removal.rstrip('\n'):
                                 pos = i
                                 break
 
@@ -1411,8 +1411,7 @@ class UnifiedDiffEditor:
             actual_removal_count = len(removals) if removals else orig_count
             
             # Replace the removal span with the additions.
-            # We don't adjust offset here since we process hunks sequentially
-            # and want to preserve the exact positioning
+            # We need to be careful about positioning since we're modifying the result in-place
             result[pos: pos + actual_removal_count] = additions
 
         return "".join(result)
