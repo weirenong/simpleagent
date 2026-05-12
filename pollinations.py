@@ -11,6 +11,7 @@ class PollinationsConfig:
     api_key: Optional[str] = None
     safe: Optional[str] = None
     client_id: Optional[str] = "pk_oCsTjaPx4Kj8WEaY"  # For Bring Your Own Pollen
+    device_auth_base_url: str = "https://enter.pollinations.ai"
 
 
 class PollinationsClient:
@@ -130,7 +131,7 @@ class PollinationsClient:
 
     def request_device_code(self, scope: str = "generate") -> Dict[str, Any]:
         """Request a device code for Bring Your Own Pollen (Device Flow)"""
-        url = f"{self.config.base_url}/api/device/code"
+        url = f"{self.config.device_auth_base_url}/api/device/code"
         
         payload = {
             "client_id": self.config.client_id,
@@ -143,7 +144,7 @@ class PollinationsClient:
 
     def poll_for_device_token(self, device_code: str, poll_interval: int = 5) -> Dict[str, Any]:
         """Poll for the user-authorized token (Device Flow)"""
-        url = f"{self.config.base_url}/api/device/token"
+        url = f"{self.config.device_auth_base_url}/api/device/token"
         
         payload = {
             "device_code": device_code
@@ -166,7 +167,7 @@ class PollinationsClient:
 
     def get_user_info(self, access_token: str) -> Dict[str, Any]:
         """Get user information using an access token"""
-        url = f"{self.config.base_url}/api/device/userinfo"
+        url = f"{self.config.device_auth_base_url}/api/device/userinfo"
         
         headers = {
             "Authorization": f"Bearer {access_token}"
