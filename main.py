@@ -107,6 +107,7 @@ COMMANDS = {
     "/about": "Show app info",
     "/version": "Show version",
     "/help": "Show this help menu",
+    "/api-pollinations": "Authenticate with Pollinations API using Bring Your Own Pollen",
     "/exit": "Exit app",
     "/quit": "Exit app",
     "/q": "Exit app",
@@ -127,6 +128,7 @@ COMMAND_USAGE = {
     "/workflow-debug": "/workflow-debug",
     "/markup": "/markup",
     "/workspace": "/workspace <path...>",
+    "/api-pollinations": "/api-pollinations",
 }
 
 THINK_BLOCK_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
@@ -2687,6 +2689,10 @@ class SimpleAgentTUI(TuiFormatter):
 
             return True
 
+        if command == "/api-pollinations":
+            self.authenticate_with_pollinations()
+            return True
+
         self.print_error(f"Unknown command: {command}")
         self.print_dim("Type /help to see available commands.")
         print()
@@ -3428,6 +3434,62 @@ class SimpleAgentTUI(TuiFormatter):
             complete_while_typing=True,
             default=default_text,
         )
+
+    def authenticate_with_pollinations(self) -> None:
+        """
+        Authenticate with Pollinations API using the Bring Your Own Pollen device flow.
+        """
+        print()
+        self.print_info("Starting Pollinations API authentication...")
+        self.print_dim("This will open a browser window for you to authorize the app.")
+        self.print_dim("After authorization, your API key will be saved to your config.")
+        print()
+
+        try:
+            # Request device code
+            device_code_response = self.pollinations_client.request_device_code()
+            device_code = device_code_response.get("device_code")
+            user_code = device_code_response.get("user_code")
+            verification_uri = device_code_response.get("verification_uri")
+            
+            if not device_code or not user_code or not verification_uri:
+                self.print_error("Failed to get device code from Pollinations API")
+                return
+            
+            # Display instructions
+            self.print_info(f"Please visit: https://enter.pollinations.ai{verification_uri}")
+            self.print_info(f"Enter this code: {user_code}")
+            self.print_dim("Then click 'Allow' to authorize this app.")
+            print()
+            
+            # Poll for the access token
+            self.print_dim("Waiting for authorization...")
+            token_response = self.pollinations_client.poll_for_device_token(device_code)
+            
+            if "access_token" in token_response:
+                access_token = token_response["access_token"]
+                
+                # Get user info to confirm successful auth
+                user_info = self.pollinations_client.get_user_info(access_token)
+                
+                # Save the API key to environment variable and config
+                os.environ["POLLINATIONS_API_KEY"] = access_token
+                
+                # Update config with the API key
+                self.config["pollinations_api_key"] = access_token
+                save_config(self.config)
+                
+                self.print_info("Successfully authenticated with Pollinations API!")
+                self.print_info(f"User: {user_info.get('name', 'Anonymous')}")
+                self.print_dim("Your API key has been saved to config.")
+                print()
+            else:
+                self.print_error("Authentication failed. Please try again.")
+                print()
+                
+        except Exception as e:
+            self.print_error(f"Authentication error: {e}")
+            print()
 
     def clear_screen(self) -> None:
         # Clear visible screen, clear scrollback buffer where supported, then move cursor home.
