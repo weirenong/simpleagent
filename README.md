@@ -2,7 +2,7 @@
 
 ![SimpleAgent mascot logo](screenshots/mascot_logo.png)
 
-**SimpleAgent** is a local AI coding agent built around a simple idea: small models can become useful when the surrounding system gives them strong structure, good context, safe patching, and human-in-the-loop review.
+**SimpleAgent** is primarily a local AI coding agent built around a simple idea: small models can become useful when the surrounding system gives them strong structure, good context, safe patching, and human-in-the-loop review.
 
 Tested on Macbook Pro M2, 16GB RAM. This is made for users who wants to experience a local model with tool-like capabilities with their edge devices.
 
