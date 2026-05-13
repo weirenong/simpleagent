@@ -1268,10 +1268,24 @@ class SimpleAgentTUI(TuiFormatter):
         if not self.web_context_items:
             return ""
 
-        try:
-            query_embedding = vectorise_text(self.client, query_text, self.embedding_model)
-        except Exception:
-            return ""
+        # Check if this is a Pollinations embedding model
+        # Handle both "pollinations/openai-3-small" and "openai-3-small" formats
+        embedding_model_name = self.embedding_model
+        if embedding_model_name.startswith("pollinations/"):
+            embedding_model_name = embedding_model_name.split("/", 1)[1]
+        
+        if embedding_model_name in self.pollinations_client.list_models_whitelisted():
+            # Use Pollinations client for embeddings
+            try:
+                query_embedding = self.pollinations_client.create_embeddings(query_text)
+            except Exception:
+                return ""
+        else:
+            # Use Ollama client for embeddings
+            try:
+                query_embedding = vectorise_text(self.client, query_text, self.embedding_model)
+            except Exception:
+                return ""
 
         if not utils.is_embedding_vector(query_embedding):
             return ""
@@ -1314,10 +1328,24 @@ class SimpleAgentTUI(TuiFormatter):
         if not self.memory_items:
             return ""
 
-        try:
-            query_embedding = vectorise_text(self.client, query_text, self.embedding_model)
-        except Exception:
-            return ""
+        # Check if this is a Pollinations embedding model
+        # Handle both "pollinations/openai-3-small" and "openai-3-small" formats
+        embedding_model_name = self.embedding_model
+        if embedding_model_name.startswith("pollinations/"):
+            embedding_model_name = embedding_model_name.split("/", 1)[1]
+        
+        if embedding_model_name in self.pollinations_client.list_models_whitelisted():
+            # Use Pollinations client for embeddings
+            try:
+                query_embedding = self.pollinations_client.create_embeddings(query_text)
+            except Exception:
+                return ""
+        else:
+            # Use Ollama client for embeddings
+            try:
+                query_embedding = vectorise_text(self.client, query_text, self.embedding_model)
+            except Exception:
+                return ""
 
         if not utils.is_embedding_vector(query_embedding):
             return ""
@@ -1348,10 +1376,24 @@ class SimpleAgentTUI(TuiFormatter):
         if not self.attachment_context_items:
             return ""
 
-        try:
-            query_embedding = vectorise_text(self.client, query_text, self.embedding_model)
-        except Exception:
-            return ""
+        # Check if this is a Pollinations embedding model
+        # Handle both "pollinations/openai-3-small" and "openai-3-small" formats
+        embedding_model_name = self.embedding_model
+        if embedding_model_name.startswith("pollinations/"):
+            embedding_model_name = embedding_model_name.split("/", 1)[1]
+        
+        if embedding_model_name in self.pollinations_client.list_models_whitelisted():
+            # Use Pollinations client for embeddings
+            try:
+                query_embedding = self.pollinations_client.create_embeddings(query_text)
+            except Exception:
+                return ""
+        else:
+            # Use Ollama client for embeddings
+            try:
+                query_embedding = vectorise_text(self.client, query_text, self.embedding_model)
+            except Exception:
+                return ""
 
         if not utils.is_embedding_vector(query_embedding):
             return ""
@@ -2050,11 +2092,26 @@ class SimpleAgentTUI(TuiFormatter):
                 },
             )
 
-            embedded_items = utils.vectorise_context_items(
-                client=self.client,
-                context_items=context_items,
-                model=self.embedding_model,
-            )
+            # Check if this is a Pollinations embedding model
+            # Handle both "pollinations/openai-3-small" and "openai-3-small" formats
+            embedding_model_name = self.embedding_model
+            if embedding_model_name.startswith("pollinations/"):
+                embedding_model_name = embedding_model_name.split("/", 1)[1]
+            
+            if embedding_model_name in self.pollinations_client.list_models_whitelisted():
+                # Use Pollinations client for embeddings
+                embedded_items = utils.vectorise_context_items(
+                    client=self.pollinations_client,
+                    context_items=context_items,
+                    model=self.embedding_model,  # Pass the full model name including pollinations/
+                )
+            else:
+                # Use Ollama client for embeddings
+                embedded_items = utils.vectorise_context_items(
+                    client=self.client,
+                    context_items=context_items,
+                    model=self.embedding_model,
+                )
         except Exception as error:
             print()
             self.print_error(f"Could not embed web context {title}: {error}")
