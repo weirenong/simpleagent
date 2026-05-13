@@ -597,7 +597,7 @@ class SimpleAgentTUI(TuiFormatter):
         )
         
         # Initialize Pollinations client
-        pollinations_api_key = os.getenv("POLLINATIONS_API_KEY") or self.config.get("pollinations_api_key")
+        pollinations_api_key = os.getenv("POLLINATIONS_API_KEY")
         self.pollinations_client = PollinationsClient(
             PollinationsConfig(api_key=pollinations_api_key)
         )
@@ -2289,15 +2289,11 @@ class SimpleAgentTUI(TuiFormatter):
         # Check if this is a Pollinations model
         if self.model in self.pollinations_client.list_models_whitelisted():
             # Use Pollinations client for Pollinations models
-            try:
-                response_stream = self.pollinations_client.chat_completions(
-                    messages=chat_messages,
-                    model=self.model,
-                    stream=True
-                )
-            except Exception as e:
-                self.print_error(f"Pollinations API error: {e}")
-                raise
+            response_stream = self.pollinations_client.chat_completions(
+                messages=chat_messages,
+                model=self.model,
+                stream=True
+            )
         else:
             # Use Ollama client for Ollama models
             response_stream = self.client.chat(
@@ -3305,7 +3301,6 @@ class SimpleAgentTUI(TuiFormatter):
         if persist:
             self.config["model"] = model
             save_config(self.config)
-            
             self.print_info(
                 f"Model changed to: {self.model}{self.format_num_context(self.model_num_context)} and saved to {CONFIG_FILE}"
             )
@@ -3582,15 +3577,12 @@ class SimpleAgentTUI(TuiFormatter):
             user_code = device_code_response.get("user_code")
             verification_uri = device_code_response.get("verification_uri")
             
-            if not device_code or not user_code:
+            if not device_code or not user_code or not verification_uri:
                 self.print_error("Failed to get device code from Pollinations API")
                 return
             
             # Display instructions
-            if verification_uri:
-                self.print_info(f"Please visit: https://enter.pollinations.ai{verification_uri}")
-            else:
-                self.print_info("Please visit: https://enter.pollinations.ai/device")
+            self.print_info(f"Please visit: {verification_uri}")
             self.print_info(f"Enter this code: {user_code}")
             self.print_dim("Then click 'Allow' to authorize this app.")
             print()
@@ -3612,20 +3604,12 @@ class SimpleAgentTUI(TuiFormatter):
                 self.config["pollinations_api_key"] = access_token
                 save_config(self.config)
                 
-                # Update the existing client with the new API key
-                self.pollinations_client.set_api_key(access_token)
-                
                 self.print_info("Successfully authenticated with Pollinations API!")
                 self.print_info(f"User: {user_info.get('name', 'Anonymous')}")
                 self.print_dim("Your API key has been saved to config.")
                 print()
             else:
-                # Check if there's an error in the response
-                if "error" in token_response:
-                    error_msg = token_response.get("error", "Unknown error")
-                    self.print_error(f"Authentication failed: {error_msg}")
-                else:
-                    self.print_error("Authentication failed. Please try again.")
+                self.print_error("Authentication failed. Please try again.")
                 print()
                 
         except Exception as e:
