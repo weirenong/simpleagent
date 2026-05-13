@@ -199,6 +199,30 @@ class PollinationsClient:
             # Handle HTTP errors
             raise Exception(f"Pollinations API request failed: {e}")
 
+    def authenticate_with_device_flow(self, poll_interval: int = 5) -> Dict[str, Any]:
+        """Authenticate using the device flow (Bring Your Own Pollen)"""
+        # Step 1: Request device code
+        device_data = self.request_device_code()
+        
+        # Show user instructions
+        user_code = device_data.get("user_code")
+        verification_uri = device_data.get("verification_uri")
+        
+        if not user_code or not verification_uri:
+            raise Exception("Failed to obtain device code data")
+            
+        print(f"Please visit {self.config.device_auth_base_url}{verification_uri}")
+        print(f"Enter the code: {user_code}")
+        print("Waiting for authentication...")
+        
+        # Step 2: Poll for access token
+        device_code = device_data.get("device_code")
+        if not device_code:
+            raise Exception("Failed to obtain device code")
+            
+        token_data = self.poll_for_device_token(device_code, poll_interval)
+        return token_data
+
     def request_device_code(self) -> Dict[str, Any]:
         """Request a device code for Bring Your Own Pollen (Device Flow)"""
         url = f"{self.config.device_auth_base_url}/api/device/code"
