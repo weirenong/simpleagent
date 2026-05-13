@@ -213,11 +213,13 @@ class PollinationsClient:
         # Check if response is valid JSON before parsing
         try:
             response.raise_for_status()
-            return response.json()
-        except ValueError as e:
-            # Handle case where response is not valid JSON
-            error_text = response.text
-            raise Exception(f"Invalid JSON response from Pollinations API: {error_text} (Error: {e})")
+            # Log the raw response for debugging
+            try:
+                data = response.json()
+                return data
+            except ValueError:
+                # If JSON parsing fails, return the raw text
+                raise Exception(f"Invalid JSON response from Pollinations API: {response.text}")
         except requests.exceptions.RequestException as e:
             # Handle HTTP errors
             raise Exception(f"Pollinations API request failed: {e}")
@@ -236,20 +238,22 @@ class PollinationsClient:
             # Check if response is valid JSON before parsing
             try:
                 if response.status_code == 200:
-                    return response.json()
+                    try:
+                        return response.json()
+                    except ValueError:
+                        raise Exception(f"Invalid JSON response from Pollinations API: {response.text}")
                 elif response.status_code == 400:
-                    data = response.json()
-                    if data.get("error") == "authorization_pending":
-                        time.sleep(poll_interval)
-                        continue
-                    else:
-                        response.raise_for_status()
+                    try:
+                        data = response.json()
+                        if data.get("error") == "authorization_pending":
+                            time.sleep(poll_interval)
+                            continue
+                        else:
+                            raise Exception(f"Authentication error: {data.get('error', 'Unknown error')}")
+                    except ValueError:
+                        raise Exception(f"Invalid JSON response from Pollinations API: {response.text}")
                 else:
                     response.raise_for_status()
-            except ValueError as e:
-                # Handle case where response is not valid JSON
-                error_text = response.text
-                raise Exception(f"Invalid JSON response from Pollinations API: {error_text} (Error: {e})")
             except requests.exceptions.RequestException as e:
                 # Handle HTTP errors
                 raise Exception(f"Pollinations API request failed: {e}")

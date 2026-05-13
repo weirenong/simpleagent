@@ -3582,12 +3582,15 @@ class SimpleAgentTUI(TuiFormatter):
             user_code = device_code_response.get("user_code")
             verification_uri = device_code_response.get("verification_uri")
             
-            if not device_code or not user_code or not verification_uri:
+            if not device_code or not user_code:
                 self.print_error("Failed to get device code from Pollinations API")
                 return
             
             # Display instructions
-            self.print_info(f"Please visit: {verification_uri}")
+            if verification_uri:
+                self.print_info(f"Please visit: https://enter.pollinations.ai{verification_uri}")
+            else:
+                self.print_info("Please visit: https://enter.pollinations.ai/device")
             self.print_info(f"Enter this code: {user_code}")
             self.print_dim("Then click 'Allow' to authorize this app.")
             print()
@@ -3617,7 +3620,12 @@ class SimpleAgentTUI(TuiFormatter):
                 self.print_dim("Your API key has been saved to config.")
                 print()
             else:
-                self.print_error("Authentication failed. Please try again.")
+                # Check if there's an error in the response
+                if "error" in token_response:
+                    error_msg = token_response.get("error", "Unknown error")
+                    self.print_error(f"Authentication failed: {error_msg}")
+                else:
+                    self.print_error("Authentication failed. Please try again.")
                 print()
                 
         except Exception as e:
