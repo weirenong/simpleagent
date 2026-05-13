@@ -49,9 +49,9 @@ from PIL import Image, ImageGrab
 
 VERSION = "0.2.6"
 APP_NAME = "SimpleAgent"
-DEFAULT_MODEL = "nemotron-3-nano:4b"
-DEFAULT_EMBEDDING_MODEL = "ordis/jina-embeddings-v2-base-code:latest"
-DEFAULT_VISION_MODEL = "granite3.2-vision:2b"
+DEFAULT_MODEL = "pollinations/qwen-coder"
+DEFAULT_EMBEDDING_MODEL = "pollinations/openai-3-small"
+DEFAULT_VISION_MODEL = "pollinations/mistral"
 MAX_RECENT_MESSAGES = 2
 MAX_MEMORY_TEXT_LENGTH = 900
 MAX_RELEVANT_MEMORY_ITEMS = 8
@@ -452,8 +452,8 @@ class SimpleAgentTUI(TuiFormatter):
         self.workspace_dir = self.load_workspace_dir()
         self.temp_dir = TEMP_DIR
         self.temp_dir.mkdir(parents=True, exist_ok=True)
-        self.model = os.getenv("SIMPLEAGENT_MODEL") or self.config.get("model", DEFAULT_MODEL)
-        self.host = os.getenv("OLLAMA_HOST") or self.config.get("host", "http://localhost:11434")
+        self.model = self.config.get("model", DEFAULT_MODEL)
+        self.host = self.config.get("host", "http://localhost:11434")
         self.embedding_model = self.config.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
         self.vision_model = self.config.get("vision_model", DEFAULT_VISION_MODEL)
         legacy_system_prompt = self.config.get("system_prompt")
