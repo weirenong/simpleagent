@@ -39,91 +39,94 @@ class PollinationsClient:
             "Authorization": f"Bearer {api_key}"
         })
 
-    def chat_completions(self, 
-                        messages: List[Dict[str, str]], 
-                        model: str = "openai",
-                        temperature: float = 0.7,
-                        max_tokens: int = 1000,
-                        stream: bool = True) -> Dict[str, Any]:
+    def chat_completions(
+            self,
+            messages: List[Dict[str, str]],
+            model: str = "openai",
+            temperature: float = 0.7,
+            max_tokens: int = 1000,
+            stream: bool = True,
+    ):
         """Generate text using chat completions"""
         url = f"{self.config.base_url}/v1/chat/completions"
-        
+
         payload = {
             "model": model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "stream": stream
+            "stream": stream,
         }
-        
-        response = self.session.post(url, json=payload, stream=stream)
-        
-        if stream:
-            # Handle streaming response
-            return self._handle_streaming_response(response)
-        else:
-            # Handle regular response
-            # Check if response is valid JSON before parsing
-            try:
-                response.raise_for_status()
-                return response.json()
-            except ValueError as e:
-                # Handle case where response is not valid JSON
-                error_text = response.text
-                raise Exception(f"Invalid JSON response from Pollinations API: {error_text} (Error: {e})")
-            except requests.exceptions.RequestException as e:
-                # Handle HTTP errors
-                raise Exception(f"Pollinations API request failed: {e}")
 
-    def _handle_streaming_response(self, response) -> Dict[str, Any]:
-        """Handle streaming response from Pollinations API"""
-        full_response = ""
-        choices = []
-        
+        response = self.session.post(url, json=payload, stream=stream)
+
+        if stream:
+            response.raise_for_status()
+            return self._stream_chat_chunks(response)
+
         try:
             response.raise_for_status()
-            
-            # Process streaming response
-            for line in response.iter_lines():
-                if line:
-                    line_str = line.decode('utf-8')
-                    
-                    # Skip SSE data prefixes
-                    if line_str.startswith('data: '):
-                        data_str = line_str[6:]  # Remove 'data: ' prefix
-                    elif line_str.startswith('data:'):
-                        data_str = line_str[5:]  # Remove 'data:' prefix
-                    else:
-                        data_str = line_str
-                    
-                    # Skip empty lines
-                    if not data_str.strip():
-                        continue
-                    
-                    # Skip [DONE] marker
-                    if data_str.strip() == '[DONE]':
-                        break
-                    
-                    try:
-                        # Parse the JSON data
-                        data = json.loads(data_str)
-                        
-                        # Handle chunk data
-                        if 'choices' in data and data['choices']:
-                            choice = data['choices'][0]
-                            
-                            # Handle delta content
-                            if 'delta' in choice and 'content' in choice['delta']:
-                                content = choice['delta']['content']
-                                full_response += content
-                                
-                            # Handle finish reason
-                            if 'finish_reason' in choice and choice['finish_reason'] == 'stop':
-                                break
-                                
-                    except json.JSONDecodeError:
-                        # Skip malformed JSON lines
-                        continue
+            return response.json()
+
+        except ValueError as e:
+            error_text = response.text
+            raise Exception(
+                f"Invalid JSON response from Pollinations API: {error_text} (Error: {e})"
+            )
+
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Pollinations API request failed: {e}")
+
+    def _stream_chat_chunks(self, response):
+        """Yield streaming chunks from Pollinations API."""
+
+        try:
+            for line in response.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+
+                line_str = line.strip()
+
+                if line_str.startswith("data: "):
+                    data_str = line_str[6:]
+
+                elif line_str.startswith("data:"):
+                    data_str = line_str[5:]
+
+                else:
+                    data_str = line_str
+
+                data_str = data_str.strip()
+
+                if not data_str:
+                    continue
+
+                if data_str == "[DONE]":
+                    break
+
+                try:
+                    data = json.loads(data_str)
+
+                except json.JSONDecodeError:
+                    continue
+
+                choices = data.get("choices") or []
+                if not choices:
+                    continue
+
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+
+                content = delta.get("content")
+
+                if content:
+                    yield content
+
+                if choice.get("finish_reason") == "stop":
+                    break
+
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Pollinations API request failed: {e}")
                         
         except requests.exceptions.RequestException as e:
             raise Exception(f"Pollinations API request failed: {e}")
