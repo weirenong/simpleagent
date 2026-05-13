@@ -3182,11 +3182,19 @@ class SimpleAgentTUI(TuiFormatter):
         else:
             # Use Ollama client for embeddings
             try:
+                # Check if we need to use Ollama client for vision model too
+                vision_model_to_use = None
+                if self.vision_model in self.pollinations_client.list_models_whitelisted():
+                    # For Pollinations vision models, we don't use Ollama client for vision
+                    pass
+                else:
+                    vision_model_to_use = self.vision_model if path.suffix.lower() in IMAGE_ATTACHMENT_EXTENSIONS else None
+                    
                 embedded_context_items = utils.attachment_to_embedded_context_items(
                     client=self.client,
                     file_path=path,
                     model=self.embedding_model,
-                    vision_model=self.vision_model if path.suffix.lower() in IMAGE_ATTACHMENT_EXTENSIONS else None,
+                    vision_model=vision_model_to_use,
                 )
             except Exception as error:
                 self.print_error(f"Could not read/embed attachment {path.name}: {error}")
