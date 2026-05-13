@@ -2288,12 +2288,22 @@ class SimpleAgentTUI(TuiFormatter):
 
         # Check if this is a Pollinations model
         if self.model in self.pollinations_client.list_models_whitelisted():
-            response_stream = self.pollinations_client.chat_completions(
-                messages=chat_messages,
-                model=self.model,
-                stream=True,
-                thinking=True,  # Enable thinking for Pollinations models
-            )
+            try:
+                response_stream = self.pollinations_client.chat_completions(
+                    messages=chat_messages,
+                    model=self.model,
+                    stream=True,
+                    thinking=True,  # Enable thinking for Pollinations models
+                )
+            except Exception as e:
+                # If Pollinations API fails, fallback to Ollama
+                self.print_error(f"Pollinations API error: {e}")
+                self.print_dim("Falling back to Ollama...")
+                response_stream = self.client.chat(
+                    chat_messages,
+                    stream=True,
+                    model=self.model,
+                )
         else:
             response_stream = self.client.chat(
                 chat_messages,
