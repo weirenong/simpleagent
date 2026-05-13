@@ -102,6 +102,7 @@ COMMANDS = {
     "/workflow": "Help text for assigning workflows",
     "/workflow-install": "Install a workflow .md file and create a persona for it",
     "/workflow-debug": "Print the full prompt messages sent during last run",
+    "/response-debug": "Show raw unprocessed messages from all models since user prompt",
     "/markup": "Toggle markdown-style formatting for agent replies",
     "/history": "Show current session history",
     "/about": "Show app info",
@@ -126,6 +127,7 @@ COMMAND_USAGE = {
     "/workflow": "/workflow",
     "/workflow-install": "/workflow-install <path-to-workflow.md>",
     "/workflow-debug": "/workflow-debug",
+    "/response-debug": "/response-debug",
     "/markup": "/markup",
     "/workspace": "/workspace <path...>",
     "/api-pollinations": "/api-pollinations",
@@ -2837,6 +2839,11 @@ class SimpleAgentTUI(TuiFormatter):
                 self.show_workflow_debug()
             return True
 
+        if command == "/response-debug":
+            with patch_stdout(raw=True):
+                self.show_response_debug()
+            return True
+
         if command == "/markup":
             self.toggle_agent_reply_markup()
             return True
@@ -3513,6 +3520,45 @@ class SimpleAgentTUI(TuiFormatter):
         self.print_dim(f"Current persona: {self.active_persona}")
         self.print_dim(f"Current workflow: {self.persona_workflows.get(self.active_persona, DEFAULT_WORKFLOW_NAME)}")
         print()
+
+    def show_response_debug(self) -> None:
+        if not self.last_workflow_messages:
+            print()
+            self.print_dim("No workflow prompt has been built yet.")
+            self.print_dim("Send a normal prompt first, then run /response-debug.")
+            print()
+            return
+
+        print()
+        print(self.bold("Raw unprocessed messages from all models since user prompt"))
+        print(self.dim(f"Persona: {self.active_persona.lower()}"))
+        print(self.dim(f"Workflow: {self.persona_workflows.get(self.active_persona, DEFAULT_WORKFLOW_NAME)}"))
+        print(self.dim(f"Messages: {len(self.last_workflow_messages)}"))
+        print()
+
+        # Group messages by model (assuming we track model information somewhere)
+        # For now, we'll just show all messages with model info if available
+        
+        for index, message in enumerate(self.last_workflow_messages, start=1):
+            role = str(message.get("role") or "unknown")
+            content = str(message.get("content") or "")
+            token_estimate = self.estimate_text_tokens(content)
+
+            # Try to determine which model was used for this message
+            model_info = ""
+            if role == "assistant":
+                model_info = f" (model: {self.model})"
+            
+            print(self.blue(f"[{index:02d}] {role}{model_info} · ~{token_estimate:,} token(s)"))
+            print(self.dim("-" * 88))
+
+            if content:
+                print(content)
+            else:
+                self.print_dim("<empty>")
+
+            print(self.dim("-" * 88))
+            print()
 
     def show_workflow_debug(self) -> None:
         if not self.last_workflow_messages:
