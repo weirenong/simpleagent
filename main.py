@@ -3587,7 +3587,7 @@ class SimpleAgentTUI(TuiFormatter):
                 return
             
             # Display instructions
-            self.print_info(f"Please visit: https://enter.pollinations.ai{verification_uri}")
+            self.print_info(f"Please visit: {verification_uri}")
             self.print_info(f"Enter this code: {user_code}")
             self.print_dim("Then click 'Allow' to authorize this app.")
             print()
