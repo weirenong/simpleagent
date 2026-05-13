@@ -31,6 +31,13 @@ class PollinationsClient:
                 "Client-ID": config.client_id
             })
 
+    def set_api_key(self, api_key: str) -> None:
+        """Update the API key on the existing session."""
+        self.config.api_key = api_key
+        self.session.headers.update({
+            "Authorization": f"Bearer {api_key}"
+        })
+
     def chat_completions(self, 
                         messages: List[Dict[str, str]], 
                         model: str = "openai",

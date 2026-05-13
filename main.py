@@ -3305,6 +3305,11 @@ class SimpleAgentTUI(TuiFormatter):
         if persist:
             self.config["model"] = model
             save_config(self.config)
+
+            self.pollinations_client = PollinationsClient(
+                PollinationsConfig(api_key=access_token)
+            )
+            
             self.print_info(
                 f"Model changed to: {self.model}{self.format_num_context(self.model_num_context)} and saved to {CONFIG_FILE}"
             )
