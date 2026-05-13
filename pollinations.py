@@ -199,13 +199,12 @@ class PollinationsClient:
             # Handle HTTP errors
             raise Exception(f"Pollinations API request failed: {e}")
 
-    def request_device_code(self, scope: str = "generate") -> Dict[str, Any]:
+    def request_device_code(self) -> Dict[str, Any]:
         """Request a device code for Bring Your Own Pollen (Device Flow)"""
         url = f"{self.config.device_auth_base_url}/api/device/code"
-        
+
         payload = {
-            "client_id": self.config.client_id,
-            "scope": scope
+            "client_id": self.config.client_id
         }
         
         response = self.session.post(url, json=payload)
