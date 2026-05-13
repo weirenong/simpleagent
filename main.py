@@ -3305,10 +3305,6 @@ class SimpleAgentTUI(TuiFormatter):
         if persist:
             self.config["model"] = model
             save_config(self.config)
-
-            # Update the existing client with the new API key
-            if hasattr(self, 'pollinations_client'):
-                self.pollinations_client.set_api_key(access_token)
             
             self.print_info(
                 f"Model changed to: {self.model}{self.format_num_context(self.model_num_context)} and saved to {CONFIG_FILE}"
