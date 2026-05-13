@@ -47,7 +47,7 @@ from pollinations import PollinationsClient, PollinationsConfig
 
 from PIL import Image, ImageGrab
 
-VERSION = "0.2.6"
+VERSION = "0.2.7"
 APP_NAME = "SimpleAgent"
 DEFAULT_MODEL = "pollinations/qwen-coder"
 DEFAULT_EMBEDDING_MODEL = "pollinations/openai-3-small"
@@ -1240,7 +1240,7 @@ class SimpleAgentTUI(TuiFormatter):
         if embedding_model_name in self.pollinations_client.list_models_whitelisted():
             # Use Pollinations client for embeddings
             try:
-                embedding = self.pollinations_client.create_embeddings(memory_text, model=self.embedding_model)
+                embedding = self.pollinations_client.create_embeddings(memory_text, model=embedding_model_name)
             except Exception:
                 embedding = []
         else:
@@ -1277,13 +1277,13 @@ class SimpleAgentTUI(TuiFormatter):
         if embedding_model_name in self.pollinations_client.list_models_whitelisted():
             # Use Pollinations client for embeddings
             try:
-                query_embedding = self.pollinations_client.create_embeddings(query_text, model=self.embedding_model)
+                query_embedding = self.pollinations_client.create_embeddings(query_text, model=embedding_model_name)
             except Exception:
                 return ""
         else:
             # Use Ollama client for embeddings
             try:
-                query_embedding = vectorise_text(self.client, query_text, self.embedding_model)
+                query_embedding = vectorise_text(self.client, query_text, embedding_model_name)
             except Exception:
                 return ""
 
@@ -1337,13 +1337,13 @@ class SimpleAgentTUI(TuiFormatter):
         if embedding_model_name in self.pollinations_client.list_models_whitelisted():
             # Use Pollinations client for embeddings
             try:
-                query_embedding = self.pollinations_client.create_embeddings(query_text, model=self.embedding_model)
+                query_embedding = self.pollinations_client.create_embeddings(query_text, model=embedding_model_name)
             except Exception:
                 return ""
         else:
             # Use Ollama client for embeddings
             try:
-                query_embedding = vectorise_text(self.client, query_text, self.embedding_model)
+                query_embedding = vectorise_text(self.client, query_text, embedding_model_name)
             except Exception:
                 return ""
 
@@ -1385,13 +1385,13 @@ class SimpleAgentTUI(TuiFormatter):
         if embedding_model_name in self.pollinations_client.list_models_whitelisted():
             # Use Pollinations client for embeddings
             try:
-                query_embedding = self.pollinations_client.create_embeddings(query_text, model=self.embedding_model)
+                query_embedding = self.pollinations_client.create_embeddings(query_text, model=embedding_model_name)
             except Exception:
                 return ""
         else:
             # Use Ollama client for embeddings
             try:
-                query_embedding = vectorise_text(self.client, query_text, self.embedding_model)
+                query_embedding = vectorise_text(self.client, query_text, embedding_model_name)
             except Exception:
                 return ""
 
@@ -2041,10 +2041,20 @@ class SimpleAgentTUI(TuiFormatter):
         self.print_info(f"Scraping {len(search_results)} selected web result(s)...")
 
         try:
+            # Handle both "pollinations/openai-3-small" and "openai-3-small" formats
+            embedding_model_name = self.embedding_model
+            if embedding_model_name.startswith("pollinations/"):
+                embedding_model_name = embedding_model_name.split("/", 1)[1]
+
+            if self.embedding_model.startswith("pollinations/"):
+                embedding_client = self.pollinations_client
+            else:
+                embedding_client = self.client
+
             embedded_items = utils.duckduckgo_search_results_to_embedded_context_items(
-                client=self.client,
+                client=embedding_client,
                 query=target,
-                model=self.embedding_model,
+                model=embedding_model_name,
                 search_results=search_results,
             )
         except Exception as error:
@@ -2103,14 +2113,14 @@ class SimpleAgentTUI(TuiFormatter):
                 embedded_items = utils.vectorise_context_items(
                     client=self.pollinations_client,
                     context_items=context_items,
-                    model=self.embedding_model,  # Pass the full model name including pollinations/
+                    model=embedding_model_name,
                 )
             else:
                 # Use Ollama client for embeddings
                 embedded_items = utils.vectorise_context_items(
                     client=self.client,
                     context_items=context_items,
-                    model=self.embedding_model,
+                    model=embedding_model_name,
                 )
         except Exception as error:
             print()
@@ -3226,7 +3236,7 @@ class SimpleAgentTUI(TuiFormatter):
                 embedded_context_items = []
                 for i, chunk in enumerate(chunks):
                     try:
-                        embedding = self.pollinations_client.create_embeddings(chunk, model=self.embedding_model)
+                        embedding = self.pollinations_client.create_embeddings(chunk, model=embedding_model_name)
                         if utils.is_embedding_vector(embedding):
                             embedded_context_items.append({
                                 "source_type": "attachment_chunk",
@@ -3265,7 +3275,7 @@ class SimpleAgentTUI(TuiFormatter):
                 embedded_context_items = utils.attachment_to_embedded_context_items(
                     client=self.client,
                     file_path=path,
-                    model=self.embedding_model,
+                    model=embedding_model_name,
                     vision_model=vision_model_to_use,
                 )
             except Exception as error:
