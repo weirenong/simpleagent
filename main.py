@@ -2288,6 +2288,13 @@ class SimpleAgentTUI(TuiFormatter):
 
         # Check if this is a Pollinations model
         if self.model in self.pollinations_client.list_models_whitelisted():
+            # Check if Pollinations API key is configured
+            pollinations_configured = bool(os.getenv("POLLINATIONS_API_KEY") or self.config.get("pollinations_api_key"))
+            
+            if not pollinations_configured:
+                self.print_error("Pollinations API key not configured. Please run /api-pollinations to authenticate.")
+                raise Exception("Pollinations API key not configured")
+            
             try:
                 response_stream = self.pollinations_client.chat_completions(
                     messages=chat_messages,
