@@ -1240,7 +1240,7 @@ class SimpleAgentTUI(TuiFormatter):
         if embedding_model_name in self.pollinations_client.list_models_whitelisted():
             # Use Pollinations client for embeddings
             try:
-                embedding = self.pollinations_client.create_embeddings(memory_text)
+                embedding = self.pollinations_client.create_embeddings(memory_text, model=self.embedding_model)
             except Exception:
                 embedding = []
         else:
@@ -1277,7 +1277,7 @@ class SimpleAgentTUI(TuiFormatter):
         if embedding_model_name in self.pollinations_client.list_models_whitelisted():
             # Use Pollinations client for embeddings
             try:
-                query_embedding = self.pollinations_client.create_embeddings(query_text)
+                query_embedding = self.pollinations_client.create_embeddings(query_text, model=self.embedding_model)
             except Exception:
                 return ""
         else:
@@ -1337,7 +1337,7 @@ class SimpleAgentTUI(TuiFormatter):
         if embedding_model_name in self.pollinations_client.list_models_whitelisted():
             # Use Pollinations client for embeddings
             try:
-                query_embedding = self.pollinations_client.create_embeddings(query_text)
+                query_embedding = self.pollinations_client.create_embeddings(query_text, model=self.embedding_model)
             except Exception:
                 return ""
         else:
@@ -1385,7 +1385,7 @@ class SimpleAgentTUI(TuiFormatter):
         if embedding_model_name in self.pollinations_client.list_models_whitelisted():
             # Use Pollinations client for embeddings
             try:
-                query_embedding = self.pollinations_client.create_embeddings(query_text)
+                query_embedding = self.pollinations_client.create_embeddings(query_text, model=self.embedding_model)
             except Exception:
                 return ""
         else:
@@ -3226,7 +3226,7 @@ class SimpleAgentTUI(TuiFormatter):
                 embedded_context_items = []
                 for i, chunk in enumerate(chunks):
                     try:
-                        embedding = self.pollinations_client.create_embeddings(chunk)
+                        embedding = self.pollinations_client.create_embeddings(chunk, model=self.embedding_model)
                         if utils.is_embedding_vector(embedding):
                             embedded_context_items.append({
                                 "source_type": "attachment_chunk",
