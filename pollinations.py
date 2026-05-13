@@ -56,8 +56,18 @@ class PollinationsClient:
         }
         
         response = self.session.post(url, json=payload)
-        response.raise_for_status()
-        return response.json()
+        
+        # Check if response is valid JSON before parsing
+        try:
+            response.raise_for_status()
+            return response.json()
+        except ValueError as e:
+            # Handle case where response is not valid JSON
+            error_text = response.text
+            raise Exception(f"Invalid JSON response from Pollinations API: {error_text} (Error: {e})")
+        except requests.exceptions.RequestException as e:
+            # Handle HTTP errors
+            raise Exception(f"Pollinations API request failed: {e}")
 
     def text_generation(self, prompt: str, model: str = "openai") -> str:
         """Generate text directly"""
@@ -97,16 +107,39 @@ class PollinationsClient:
         }
         
         response = self.session.post(url, json=payload)
-        response.raise_for_status()
-        return response.json()["data"][0]["embedding"]
+        
+        # Check if response is valid JSON before parsing
+        try:
+            response.raise_for_status()
+            data = response.json()
+            if "data" not in data or len(data["data"]) == 0:
+                raise Exception("No embeddings returned from Pollinations API")
+            return data["data"][0]["embedding"]
+        except ValueError as e:
+            # Handle case where response is not valid JSON
+            error_text = response.text
+            raise Exception(f"Invalid JSON response from Pollinations API: {error_text} (Error: {e})")
+        except requests.exceptions.RequestException as e:
+            # Handle HTTP errors
+            raise Exception(f"Pollinations API request failed: {e}")
 
     def list_models(self) -> Dict[str, Any]:
         """List available models"""
         url = f"{self.config.base_url}/v1/models"
         
         response = self.session.get(url)
-        response.raise_for_status()
-        return response.json()
+        
+        # Check if response is valid JSON before parsing
+        try:
+            response.raise_for_status()
+            return response.json()
+        except ValueError as e:
+            # Handle case where response is not valid JSON
+            error_text = response.text
+            raise Exception(f"Invalid JSON response from Pollinations API: {error_text} (Error: {e})")
+        except requests.exceptions.RequestException as e:
+            # Handle HTTP errors
+            raise Exception(f"Pollinations API request failed: {e}")
 
     def list_models_whitelisted(self) -> List[str]:
         """Return curated list of whitelisted models"""
@@ -117,24 +150,54 @@ class PollinationsClient:
         url = f"{self.config.base_url}/account/profile"
         
         response = self.session.get(url)
-        response.raise_for_status()
-        return response.json()
+        
+        # Check if response is valid JSON before parsing
+        try:
+            response.raise_for_status()
+            return response.json()
+        except ValueError as e:
+            # Handle case where response is not valid JSON
+            error_text = response.text
+            raise Exception(f"Invalid JSON response from Pollinations API: {error_text} (Error: {e})")
+        except requests.exceptions.RequestException as e:
+            # Handle HTTP errors
+            raise Exception(f"Pollinations API request failed: {e}")
 
     def get_account_balance(self) -> Dict[str, Any]:
         """Get account balance"""
         url = f"{self.config.base_url}/account/balance"
         
         response = self.session.get(url)
-        response.raise_for_status()
-        return response.json()
+        
+        # Check if response is valid JSON before parsing
+        try:
+            response.raise_for_status()
+            return response.json()
+        except ValueError as e:
+            # Handle case where response is not valid JSON
+            error_text = response.text
+            raise Exception(f"Invalid JSON response from Pollinations API: {error_text} (Error: {e})")
+        except requests.exceptions.RequestException as e:
+            # Handle HTTP errors
+            raise Exception(f"Pollinations API request failed: {e}")
 
     def get_account_usage(self) -> Dict[str, Any]:
         """Get account usage history"""
         url = f"{self.config.base_url}/account/usage"
         
         response = self.session.get(url)
-        response.raise_for_status()
-        return response.json()
+        
+        # Check if response is valid JSON before parsing
+        try:
+            response.raise_for_status()
+            return response.json()
+        except ValueError as e:
+            # Handle case where response is not valid JSON
+            error_text = response.text
+            raise Exception(f"Invalid JSON response from Pollinations API: {error_text} (Error: {e})")
+        except requests.exceptions.RequestException as e:
+            # Handle HTTP errors
+            raise Exception(f"Pollinations API request failed: {e}")
 
     def request_device_code(self, scope: str = "generate") -> Dict[str, Any]:
         """Request a device code for Bring Your Own Pollen (Device Flow)"""
@@ -146,8 +209,18 @@ class PollinationsClient:
         }
         
         response = self.session.post(url, json=payload)
-        response.raise_for_status()
-        return response.json()
+        
+        # Check if response is valid JSON before parsing
+        try:
+            response.raise_for_status()
+            return response.json()
+        except ValueError as e:
+            # Handle case where response is not valid JSON
+            error_text = response.text
+            raise Exception(f"Invalid JSON response from Pollinations API: {error_text} (Error: {e})")
+        except requests.exceptions.RequestException as e:
+            # Handle HTTP errors
+            raise Exception(f"Pollinations API request failed: {e}")
 
     def poll_for_device_token(self, device_code: str, poll_interval: int = 5) -> Dict[str, Any]:
         """Poll for the user-authorized token (Device Flow)"""
@@ -160,17 +233,26 @@ class PollinationsClient:
         while True:
             response = self.session.post(url, json=payload)
             
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 400:
-                data = response.json()
-                if data.get("error") == "authorization_pending":
-                    time.sleep(poll_interval)
-                    continue
+            # Check if response is valid JSON before parsing
+            try:
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code == 400:
+                    data = response.json()
+                    if data.get("error") == "authorization_pending":
+                        time.sleep(poll_interval)
+                        continue
+                    else:
+                        response.raise_for_status()
                 else:
                     response.raise_for_status()
-            else:
-                response.raise_for_status()
+            except ValueError as e:
+                # Handle case where response is not valid JSON
+                error_text = response.text
+                raise Exception(f"Invalid JSON response from Pollinations API: {error_text} (Error: {e})")
+            except requests.exceptions.RequestException as e:
+                # Handle HTTP errors
+                raise Exception(f"Pollinations API request failed: {e}")
 
     def get_user_info(self, access_token: str) -> Dict[str, Any]:
         """Get user information using an access token"""
@@ -181,5 +263,15 @@ class PollinationsClient:
         }
         
         response = self.session.get(url, headers=headers)
-        response.raise_for_status()
-        return response.json()
+        
+        # Check if response is valid JSON before parsing
+        try:
+            response.raise_for_status()
+            return response.json()
+        except ValueError as e:
+            # Handle case where response is not valid JSON
+            error_text = response.text
+            raise Exception(f"Invalid JSON response from Pollinations API: {error_text} (Error: {e})")
+        except requests.exceptions.RequestException as e:
+            # Handle HTTP errors
+            raise Exception(f"Pollinations API request failed: {e}")
