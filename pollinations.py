@@ -215,7 +215,7 @@ class PollinationsClient:
 
     def list_models_whitelisted(self) -> List[str]:
         """Return curated list of whitelisted models"""
-        return ["mistral", "qwen-coder", "openai-3-small"]
+        return ["mistral", "qwen-safety", "qwen-coder", "qwen-coder-large", "openai-3-small"]
 
     def get_account_profile(self) -> Dict[str, Any]:
         """Get user account profile"""

@@ -47,7 +47,7 @@ from pollinations import PollinationsClient, PollinationsConfig
 
 from PIL import Image, ImageGrab
 
-VERSION = "0.2.5"
+VERSION = "0.2.6"
 APP_NAME = "SimpleAgent"
 DEFAULT_MODEL = "nemotron-3-nano:4b"
 DEFAULT_EMBEDDING_MODEL = "ordis/jina-embeddings-v2-base-code:latest"
