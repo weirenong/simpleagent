@@ -456,6 +456,15 @@ class SimpleAgentTUI(TuiFormatter):
         self.host = self.config.get("host", "http://localhost:11434")
         self.embedding_model = self.config.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
         self.vision_model = self.config.get("vision_model", DEFAULT_VISION_MODEL)
+        
+        # Check if default models are Pollinations models and adjust accordingly
+        if self.model.startswith("pollinations/"):
+            # For Pollinations models, we don't need to initialize Ollama client for these
+            # The Ollama client will be used only for non-Pollinations models
+            pass
+        else:
+            # For Ollama models, initialize the Ollama client
+            pass
         legacy_system_prompt = self.config.get("system_prompt")
         configured_personas = self.config.get("personas")
 
@@ -586,21 +595,35 @@ class SimpleAgentTUI(TuiFormatter):
             bottom_toolbar=self.get_bottom_toolbar,
         )
 
-        self.client = OllamaClient(
-            OllamaConfig(
-                model=self.model,
-                host=self.host,
-                temperature=0.7,
-                top_p=0.9,
-                timeout=180,
-            )
-        )
-        
         # Initialize Pollinations client
         pollinations_api_key = os.getenv("POLLINATIONS_API_KEY") or self.config.get("pollinations_api_key")
         self.pollinations_client = PollinationsClient(
             PollinationsConfig(api_key=pollinations_api_key)
         )
+        
+        # Only initialize Ollama client if we're not using Pollinations models for chat
+        if not self.model.startswith("pollinations/"):
+            self.client = OllamaClient(
+                OllamaConfig(
+                    model=self.model,
+                    host=self.host,
+                    temperature=0.7,
+                    top_p=0.9,
+                    timeout=180,
+                )
+            )
+        else:
+            # For Pollinations models, we'll use the Pollinations client for chat
+            # but still initialize Ollama client for embedding/vision operations if needed
+            self.client = OllamaClient(
+                OllamaConfig(
+                    model=self.model,  # This will be overridden when needed
+                    host=self.host,
+                    temperature=0.7,
+                    top_p=0.9,
+                    timeout=180,
+                )
+            )
 
         self.install_resize_handler()
 
@@ -2337,12 +2360,14 @@ class SimpleAgentTUI(TuiFormatter):
                 self.print_error(f"Pollinations API error: {e}")
                 raise  # Re-raise the exception instead of falling back to Ollama
         else:
+            # For Ollama models, use the Ollama client
             response_stream = self.client.chat(
                 chat_messages,
                 stream=True,
                 model=self.model,
             )
 
+        # Determine which client to use based on model type
         if self.model in self.pollinations_client.list_models_whitelisted():
             normalized_response_stream = response_stream
         else:
@@ -3351,7 +3376,7 @@ class SimpleAgentTUI(TuiFormatter):
         self.model = model
         # Check if this is a Pollinations model
         if model in self.pollinations_client.list_models_whitelisted():
-            # For Pollinations models, we don't use the Ollama client
+            # For Pollinations models, we don't use the Ollama client for context info
             self.model_num_context = None
         else:
             # For Ollama models, we would use the Ollama client
