@@ -1,4 +1,5 @@
 import os
+import json
 import requests
 import time
 from typing import List, Dict, Any, Optional
@@ -55,19 +56,87 @@ class PollinationsClient:
             "stream": stream
         }
         
-        response = self.session.post(url, json=payload)
+        response = self.session.post(url, json=payload, stream=stream)
         
-        # Check if response is valid JSON before parsing
+        if stream:
+            # Handle streaming response
+            return self._handle_streaming_response(response)
+        else:
+            # Handle regular response
+            # Check if response is valid JSON before parsing
+            try:
+                response.raise_for_status()
+                return response.json()
+            except ValueError as e:
+                # Handle case where response is not valid JSON
+                error_text = response.text
+                raise Exception(f"Invalid JSON response from Pollinations API: {error_text} (Error: {e})")
+            except requests.exceptions.RequestException as e:
+                # Handle HTTP errors
+                raise Exception(f"Pollinations API request failed: {e}")
+
+    def _handle_streaming_response(self, response) -> Dict[str, Any]:
+        """Handle streaming response from Pollinations API"""
+        full_response = ""
+        choices = []
+        
         try:
             response.raise_for_status()
-            return response.json()
-        except ValueError as e:
-            # Handle case where response is not valid JSON
-            error_text = response.text
-            raise Exception(f"Invalid JSON response from Pollinations API: {error_text} (Error: {e})")
+            
+            # Process streaming response
+            for line in response.iter_lines():
+                if line:
+                    line_str = line.decode('utf-8')
+                    
+                    # Skip SSE data prefixes
+                    if line_str.startswith('data: '):
+                        data_str = line_str[6:]  # Remove 'data: ' prefix
+                    elif line_str.startswith('data:'):
+                        data_str = line_str[5:]  # Remove 'data:' prefix
+                    else:
+                        data_str = line_str
+                    
+                    # Skip empty lines
+                    if not data_str.strip():
+                        continue
+                    
+                    # Skip [DONE] marker
+                    if data_str.strip() == '[DONE]':
+                        break
+                    
+                    try:
+                        # Parse the JSON data
+                        data = json.loads(data_str)
+                        
+                        # Handle chunk data
+                        if 'choices' in data and data['choices']:
+                            choice = data['choices'][0]
+                            
+                            # Handle delta content
+                            if 'delta' in choice and 'content' in choice['delta']:
+                                content = choice['delta']['content']
+                                full_response += content
+                                
+                            # Handle finish reason
+                            if 'finish_reason' in choice and choice['finish_reason'] == 'stop':
+                                break
+                                
+                    except json.JSONDecodeError:
+                        # Skip malformed JSON lines
+                        continue
+                        
         except requests.exceptions.RequestException as e:
-            # Handle HTTP errors
             raise Exception(f"Pollinations API request failed: {e}")
+            
+        # Return the complete response structure
+        return {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": full_response
+                }
+            }]
+        }
 
     def text_generation(self, prompt: str, model: str = "openai") -> str:
         """Generate text directly"""
