@@ -3795,6 +3795,10 @@ class SimpleAgentTUI(TuiFormatter):
         if not model:
             return None
 
+        # Check if this is a Pollinations model - if so, return None since Pollinations models don't have context lengths
+        if model in self.pollinations_client.list_models_whitelisted():
+            return None
+
         try:
             response = self.ollama_show_model(model)
         except Exception:
