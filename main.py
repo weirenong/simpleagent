@@ -2413,6 +2413,9 @@ class SimpleAgentTUI(TuiFormatter):
         thinking_started = False
         maybe_thinking_prefix = False
 
+        # Track raw responses for debugging
+        raw_responses = []
+        
         # Check if this is a Pollinations model
         if self.model in self.pollinations_client.list_models_whitelisted():
             # Check if Pollinations API key is configured
@@ -2443,13 +2446,11 @@ class SimpleAgentTUI(TuiFormatter):
                 model=self.model,
             )
 
-        # Track raw responses for debugging
-        raw_responses = []
-        
         # Determine which client to use based on model type
         if self.model in self.pollinations_client.list_models_whitelisted():
             # For Pollinations models, we need to handle the JSON response format properly
             def normalize_pollinations_stream(stream):
+                full_response = ""
                 for chunk in stream:
                     # Store raw chunk for debugging BEFORE any processing
                     raw_responses.append(chunk)
@@ -2463,9 +2464,11 @@ class SimpleAgentTUI(TuiFormatter):
                             message = choice.get("message", {})
                             content = message.get("content", "")
                             if content:
+                                full_response += content
                                 yield content
                     elif isinstance(chunk, str):
                         # Handle string chunks that might be content
+                        full_response += chunk
                         yield chunk
             
             normalized_response_stream = normalize_pollinations_stream(raw_response_stream)
@@ -2473,14 +2476,18 @@ class SimpleAgentTUI(TuiFormatter):
             # For Ollama, the response stream yields dictionaries with message content
             # But sometimes it can yield raw strings, so we need to handle both cases
             def normalize_ollama_stream(stream):
+                full_response = ""
                 for chunk in stream:
                     # Store raw chunk for debugging BEFORE any processing
                     raw_responses.append(chunk)
                     
                     if isinstance(chunk, dict):
-                        yield chunk.get("message", {}).get("content", "")
+                        content = chunk.get("message", {}).get("content", "")
+                        full_response += content
+                        yield content
                     else:
                         # Handle case where chunk is already a string
+                        full_response += chunk
                         yield chunk
             
             normalized_response_stream = normalize_ollama_stream(response_stream)
@@ -2597,9 +2604,10 @@ class SimpleAgentTUI(TuiFormatter):
         print()
         print()
 
-        # Store raw responses for debugging
+        # Store raw responses for debugging - this now contains the complete response
         self.raw_model_responses = raw_responses
         
+        # Return the complete response
         return f"{STREAM_THINK_START}{thinking_text}{STREAM_THINK_END}{reply_text}".strip()
 
 
