@@ -1011,27 +1011,34 @@ class SimpleAgentTUI(TuiFormatter):
         self.start_loading_toolbar()
 
         try:
-            workflow_result = self.workflow_runner.run(
+            # Collect all workflow results
+            workflow_results = []
+            for workflow_result in self.workflow_runner.run(
                 original_user_prompt=user_input,
                 execute_model=True,
-            )
-            elapsed_seconds = time.perf_counter() - started_at
+            ):
+                workflow_results.append(workflow_result)
+            
+            # Process the final result
+            if workflow_results:
+                final_workflow_result = workflow_results[-1]  # Get the last result
+                elapsed_seconds = time.perf_counter() - started_at
 
-            self.last_workflow_messages = self.flatten_workflow_debug_messages(workflow_result)
+                self.last_workflow_messages = self.flatten_workflow_debug_messages(final_workflow_result)
 
-            raw_reply = self.get_final_workflow_reply(workflow_result)
+                raw_reply = self.get_final_workflow_reply(final_workflow_result)
 
-            tokens_in = self.estimate_chat_tokens(workflow_result.messages)
-            tokens_out = self.estimate_text_tokens(raw_reply)
-            assistant_reply = self.extract_and_store_thinking(raw_reply)
-            self.last_visible_reply = assistant_reply
+                tokens_in = self.estimate_chat_tokens(final_workflow_result.messages)
+                tokens_out = self.estimate_text_tokens(raw_reply)
+                assistant_reply = self.extract_and_store_thinking(raw_reply)
+                self.last_visible_reply = assistant_reply
 
-            self.messages.append({"role": "user", "content": user_input})
-            self.messages.append(
-                {"role": "assistant", "content": assistant_reply}
-            )
-            self.compact_messages()
-            self.print_response_stats(elapsed_seconds, tokens_in, tokens_out)
+                self.messages.append({"role": "user", "content": user_input})
+                self.messages.append(
+                    {"role": "assistant", "content": assistant_reply}
+                )
+                self.compact_messages()
+                self.print_response_stats(elapsed_seconds, tokens_in, tokens_out)
 
         except Exception as exc:
             self.is_streaming_response = False
