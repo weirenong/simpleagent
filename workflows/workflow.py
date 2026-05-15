@@ -220,7 +220,7 @@ class WorkflowRunner:
             self,
             original_user_prompt: str,
             execute_model: bool = False,
-    ) -> WorkflowResult:
+    ):
         prompt_results: dict[str, WorkflowPromptResult] = {}
         visible_output = ""
         last_messages: list[dict[str, str]] = []
@@ -239,6 +239,13 @@ class WorkflowRunner:
             last_messages = messages
 
             if execute_model:
+                # Yield the messages for streaming
+                yield WorkflowResult(
+                    messages=messages,
+                    prompt_results=prompt_results,
+                    visible_output=visible_output,
+                )
+                
                 raw_output = self.app.run_chat_model_for_workflow(messages)
                 visible_output_block = strip_thinking_blocks(raw_output)
             else:
@@ -259,7 +266,8 @@ class WorkflowRunner:
             if not execute_model:
                 break
 
-        return WorkflowResult(
+        # Final result
+        yield WorkflowResult(
             messages=last_messages,
             prompt_results=prompt_results,
             visible_output=visible_output,
@@ -511,9 +519,9 @@ def run_workflow(
     original_user_prompt: str,
     workflow_path: str | Path | None = None,
     execute_model: bool = False,
-) -> WorkflowResult:
+):
     workflow = load_workflow(workflow_path)
-    return WorkflowRunner(app=app, workflow=workflow).run(
+    yield from WorkflowRunner(app=app, workflow=workflow).run(
         original_user_prompt=original_user_prompt,
         execute_model=execute_model,
     )
