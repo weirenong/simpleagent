@@ -1011,18 +1011,21 @@ class SimpleAgentTUI(TuiFormatter):
         self.start_loading_toolbar()
 
         try:
-            # For streaming, we don't need to collect all results - let the workflow runner
-            # handle the streaming internally through run_chat_model_for_workflow
+            # Process workflow results as they come in for streaming
+            # The actual streaming happens in stream_chat_reply() which is called
+            # from run_chat_model_for_workflow() for each prompt in the workflow
             workflow_result = None
             for workflow_result in self.workflow_runner.run(
                 original_user_prompt=user_input,
                 execute_model=True,
             ):
-                # Just iterate through results to trigger the streaming behavior
-                # The actual streaming happens in run_chat_model_for_workflow
+                # The workflow runner yields intermediate results, but the actual
+                # streaming happens in run_chat_model_for_workflow() which calls
+                # stream_chat_reply() for each prompt. We just need to let it run.
+                # The streaming output should appear in real-time as chunks arrive.
                 pass
             
-            # Process the final result
+            # Process the final result after all streaming is complete
             if workflow_result:
                 elapsed_seconds = time.perf_counter() - started_at
 
